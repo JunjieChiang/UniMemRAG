@@ -28,6 +28,7 @@ examples/log/
 # Data, checkpoints, and vector indexes
 storage/
 snapshots/
+out/
 qdrant
 *.ckpt
 *.pt
@@ -42,8 +43,7 @@ qdrant
 
 # Generated predictions/results
 examples/results/
-infoseek_wo_rag_predictions.jsonl
-infoseek_memtree_predictions_all.jsonl
+*.jsonl
 
 # Notebook artifacts
 .ipynb_checkpoints/
