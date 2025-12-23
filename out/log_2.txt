@@ -1,0 +1,52 @@
+/hpc2hdd/home/sguo349/miniconda3/envs/unimemrag/lib/python3.11/site-packages/requests/__init__.py:86: RequestsDependencyWarning: Unable to find acceptable character detection dependency (chardet or charset_normalizer).
+  warnings.warn(
+Using a slow image processor as `use_fast` is unset and a slow processor was saved with this model. `use_fast=True` will be the default behavior in v4.52, even if the model was saved with a slow processor. This will result in minor differences in outputs. You'll still be able to use a slow processor with `use_fast=False`.
+/hpc2hdd/home/sguo349/junjiejiang/algorithm/UniMemRAG/unimemrag/vector_store/qdrant.py:40: UserWarning: Qdrant client version 1.15.1 is incompatible with server version 1.12.0. Major versions should match and minor version difference must not exceed 1. Set check_compatibility=False to skip version check.
+  self.client = QdrantClient(
+`torch_dtype` is deprecated! Use `dtype` instead!
+You are attempting to use Flash Attention 2 without specifying a torch dtype. This might lead to unexpected behaviour
+Loading checkpoint shards:   0%|          | 0/5 [00:00<?, ?it/s]Loading checkpoint shards:  20%|██        | 1/5 [00:02<00:08,  2.04s/it]Loading checkpoint shards:  40%|████      | 2/5 [00:03<00:05,  1.96s/it]Loading checkpoint shards:  60%|██████    | 3/5 [00:05<00:03,  1.92s/it]Loading checkpoint shards:  80%|████████  | 4/5 [00:07<00:01,  1.89s/it]Loading checkpoint shards: 100%|██████████| 5/5 [00:08<00:00,  1.38s/it]Loading checkpoint shards: 100%|██████████| 5/5 [00:08<00:00,  1.63s/it]
+The image processor of type `Qwen2VLImageProcessor` is now loaded as a fast processor by default, even if the model checkpoint was saved with a slow processor. This is a breaking change and may produce slightly different outputs. To continue using the slow processor, instantiate this class with `use_fast=False`. Note that this behavior will be extended to all models in a future release.
+
+
+Evaluating InfoSeek:   0%|          | 0/18628 [00:00<?, ?it/s][A[A
+
+Evaluating InfoSeek:   0%|          | 32/18628 [00:00<08:46, 35.34it/s][A[A
+
+Evaluating InfoSeek:   0%|          | 36/18628 [00:01<14:05, 21.98it/s][A[A
+
+Evaluating InfoSeek:   0%|          | 38/18628 [00:01<14:38, 21.17it/s][A[A
+
+Evaluating InfoSeek:   0%|          | 38/18628 [00:20<14:38, 21.17it/s][A[A
+
+Evaluating InfoSeek:   0%|          | 39/18628 [00:35<11:32:03,  2.23s/it][A[A
+
+Evaluating InfoSeek:   0%|          | 47/18628 [01:16<18:05:53,  3.51s/it][A[A
+
+Evaluating InfoSeek:   0%|          | 55/18628 [01:39<16:47:57,  3.26s/it][A[A
+
+Evaluating InfoSeek:   0%|          | 63/18628 [02:03<16:13:21,  3.15s/it][A[A
+
+Evaluating InfoSeek:   0%|          | 71/18628 [02:18<14:08:24,  2.74s/it][A[A
+
+Evaluating InfoSeek:   0%|          | 79/18628 [02:43<14:38:19,  2.84s/it][A[A
+
+Evaluating InfoSeek:   0%|          | 87/18628 [03:09<15:28:51,  3.01s/it][A[A
+
+Evaluating InfoSeek:   1%|          | 95/18628 [03:47<18:15:57,  3.55s/it][A[A
+
+Evaluating InfoSeek:   1%|          | 103/18628 [04:12<17:32:37,  3.41s/it][A[A
+
+Evaluating InfoSeek:   1%|          | 111/18628 [04:37<17:05:38,  3.32s/it][A[A
+
+Evaluating InfoSeek:   1%|          | 119/18628 [05:10<18:13:05,  3.54s/it][A[A
+
+Evaluating InfoSeek:   1%|          | 127/18628 [05:27<16:03:23,  3.12s/it][A[A
+
+Evaluating InfoSeek:   1%|          | 135/18628 [05:53<16:11:43,  3.15s/it][A[A
+
+Evaluating InfoSeek:   1%|          | 143/18628 [06:36<19:46:44,  3.85s/it][A[A
+
+Evaluating InfoSeek:   1%|          | 151/18628 [07:03<18:52:50,  3.68s/it][A[A
+
+Evaluating InfoSeek:   1%|          | 159/18628 [07:25<17:31:06,  3.41s/it][A[A

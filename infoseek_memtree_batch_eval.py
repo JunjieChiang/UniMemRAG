@@ -11,8 +11,10 @@ import argparse
 import json
 import os
 import re
+import queue
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Sequence, Union
+from concurrent.futures import ThreadPoolExecutor
 
 import torch
 from tqdm import tqdm
@@ -285,14 +287,23 @@ def run_infoseek_evaluation(
     max_sections: int = 3,
     max_leaves: int = 2,
     max_context_chars: int = 2048,
+    retrieval_workers: int = 4,
+    prefetch_batches: int = 4,
+    tqdm_position: int = 0,
 ) -> Dict[str, Any]:
     if batch_size <= 0:
         raise ValueError("batch_size must be a positive integer.")
+    if retrieval_workers <= 0:
+        retrieval_workers = 1
+    if prefetch_batches <= 0:
+        prefetch_batches = 1
+
+    max_inflight = max(batch_size * prefetch_batches, batch_size)
 
     records: List[Dict[str, Any]] = []
     skipped = 0
     iterable = dataset if limit is None else dataset[:limit]
-    iterator = tqdm(iterable, desc="Evaluating InfoSeek", leave=False) if show_progress else iterable
+    iterator = tqdm(iterable, desc="Evaluating InfoSeek", leave=False, position=tqdm_position) if show_progress else iterable
 
     pending_examples: List[Dict[str, Any]] = []
     pending_messages: List[List[Dict[str, Any]]] = []
@@ -358,32 +369,24 @@ def run_infoseek_evaluation(
         pending_examples = []
         pending_messages = []
 
-    for example in iterator:
+    def _prepare_example(example: Dict[str, Any]) -> Optional[Dict[str, Any]]:
         try:
             image_path = resolve_infoseek_image(example["image_id"], images_root=images_root)
         except FileNotFoundError as exc:
             data_id = example.get("data_id") or example.get("image_id") or "unknown"
             _log(f"Skipping {data_id}: {exc}")
-            skipped += 1
-            continue
+            return None
 
         question = example.get("question", "")
-        try:
-            results = memforest_store.retrieve(
-                embedder,
-                query_text=question,
-                query_image=image_path.as_posix(),
-                root_top_k=root_top_k,
-                event_top_k=event_top_k,
-                leaf_top_k=leaf_top_k,
-                alpha=alpha,
-            )
-        except Exception as exc:
-            data_id = example.get("data_id") or example.get("image_id") or "unknown"
-            _log(f"Skipping {data_id}: retrieval failed: {exc}")
-            skipped += 1
-            continue
-
+        results = memforest_store.retrieve(
+            embedder,
+            query_text=question,
+            query_image=image_path.as_posix(),
+            root_top_k=root_top_k,
+            event_top_k=event_top_k,
+            leaf_top_k=leaf_top_k,
+            alpha=alpha,
+        )
         context = build_context(
             results,
             max_trees=max_trees,
@@ -393,18 +396,53 @@ def run_infoseek_evaluation(
         )
         messages = build_infoseek_message(question, image_path=image_path, context=context)
         retrieval_meta = build_retrieval_metadata(results)
+        return {
+            "example": example,
+            "context": context,
+            "retrieval": retrieval_meta,
+            "messages": messages,
+        }
 
-        pending_examples.append(
-            {
-                "example": example,
-                "context": context,
-                "retrieval": retrieval_meta,
-            }
-        )
-        pending_messages.append(messages)
+    done_queue: "queue.Queue[Any]" = queue.Queue()
+    inflight = 0
 
+    def _submit(example: Dict[str, Any], executor: ThreadPoolExecutor) -> None:
+        nonlocal inflight
+        future = executor.submit(_prepare_example, example)
+        future.add_done_callback(done_queue.put)
+        inflight += 1
+
+    def _drain_one(block: bool = False) -> bool:
+        nonlocal inflight, skipped
+        try:
+            fut = done_queue.get(block=block, timeout=1 if block else 0)
+        except queue.Empty:
+            return False
+        inflight -= 1
+        try:
+            prepared = fut.result()
+        except Exception as exc:  # pragma: no cover - defensive
+            _log(f"Skipping example due to worker error: {exc}")
+            skipped += 1
+            return True
+        if prepared is None:
+            skipped += 1
+            return True
+
+        pending_examples.append(prepared)
+        pending_messages.append(prepared["messages"])
         if len(pending_messages) >= batch_size:
             _flush_batch()
+        return True
+
+    with ThreadPoolExecutor(max_workers=retrieval_workers) as executor:
+        for example in iterator:
+            _submit(example, executor)
+            while inflight >= max_inflight:
+                _drain_one(block=True)
+
+        while inflight > 0:
+            _drain_one(block=True)
 
     _flush_batch()
 
@@ -450,7 +488,7 @@ def main() -> None:
     parser.add_argument("--images-root", default=None)
     parser.add_argument("--save-path", default="infoseek_memtree_predictions.jsonl")
     parser.add_argument("--limit", type=int, default=None)
-    parser.add_argument("--batch-size", type=int, default=8)
+    parser.add_argument("--batch-size", type=int, default=25)
     parser.add_argument("--max-new-tokens", type=int, default=4096)
     parser.add_argument("--collection", default="memtree")
     parser.add_argument("--clip-model", default="../ckpts/clip-vit-base-patch32")
@@ -463,6 +501,9 @@ def main() -> None:
     parser.add_argument("--max-sections", type=int, default=3)
     parser.add_argument("--max-leaves", type=int, default=2)
     parser.add_argument("--max-context-chars", type=int, default=2048)
+    parser.add_argument("--retrieval-workers", type=int, default=4)
+    parser.add_argument("--prefetch-batches", type=int, default=4)
+    parser.add_argument("--tqdm-position", type=int, default=0)
     parser.add_argument("--ingest-kb", action="store_true")
     parser.add_argument("--kb-path", default="../benchmark/infoseek/wiki_text/wiki_100_dict_v4.json")
     parser.add_argument("--image-cache-dir", default="../benchmark/infoseek/wiki_text/images_100k")
@@ -528,6 +569,9 @@ def main() -> None:
         max_sections=args.max_sections,
         max_leaves=args.max_leaves,
         max_context_chars=args.max_context_chars,
+        retrieval_workers=args.retrieval_workers,
+        prefetch_batches=args.prefetch_batches,
+        tqdm_position=args.tqdm_position,
     )
 
     print(results["metrics"])
