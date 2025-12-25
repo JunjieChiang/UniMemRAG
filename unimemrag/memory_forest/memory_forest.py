@@ -3,6 +3,7 @@ from __future__ import annotations
 import hashlib
 import logging
 import uuid
+from pathlib import Path
 from collections import defaultdict
 from dataclasses import dataclass, field
 from enum import Enum
@@ -17,6 +18,25 @@ from unimemrag.vector_store.qdrant import QdrantStore
 
 
 logger = logging.getLogger(__name__)
+
+_ALLOWED_IMAGE_EXTS = {".jpg", ".jpeg", ".png", ".webp", ".gif", ".bmp", ".tif", ".tiff"}
+
+
+def _resolve_query_image_path(query_image: Union[str, Path, Any]) -> Union[str, Any]:
+    if not isinstance(query_image, (str, Path)):
+        return query_image
+    if isinstance(query_image, str) and query_image.startswith(("http://", "https://")):
+        return query_image
+    path = Path(query_image)
+    if path.exists():
+        return path.as_posix()
+    parent = path.parent
+    if not parent.exists():
+        return query_image
+    for candidate in sorted(parent.glob(f"{path.stem}.*")):
+        if candidate.suffix.lower() in _ALLOWED_IMAGE_EXTS:
+            return candidate.as_posix()
+    return query_image if isinstance(query_image, str) else path.as_posix()
 
 
 class NodeRole(str, Enum):
@@ -1046,6 +1066,8 @@ class MemoryForestStore(QdrantStore):
             if query_text is not None
             else None
         )
+        if query_image is not None:
+            query_image = _resolve_query_image_path(query_image)
         image_vec = (
             embedder.embed_images([query_image])[0]
             if query_image is not None
@@ -1118,6 +1140,8 @@ class MemoryForestStore(QdrantStore):
             if query_text is not None
             else None
         )
+        if query_image is not None:
+            query_image = _resolve_query_image_path(query_image)
         image_vec = (
             embedder.embed_images([query_image])[0]
             if query_image is not None

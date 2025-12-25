@@ -107,16 +107,20 @@ def resolve_infoseek_image(
 
     if images_root is None:
         base_dir = Path(__file__).resolve().parent
-        images_root = (base_dir / "../benchmark/oven_eval/image_downloads/oven_images").resolve()
+        images_root = (base_dir / "../benchmark/oven/").resolve()
     else:
         images_root = Path(images_root).expanduser().resolve()
 
-    image_file = images_root / bucket / f"{image_stem}.JPEG"
-    if not image_file.exists():
-        image_file = images_root / bucket / f"{image_stem}.jpg"
-        if not image_file.exists():
-            raise FileNotFoundError(f"Image file not found: {image_file}")
-    return image_file
+    bucket_dir = images_root / bucket
+    if not bucket_dir.exists():
+        raise FileNotFoundError(f"Image bucket not found: {bucket_dir}")
+
+    allowed_exts = {".jpg", ".jpeg", ".png", ".webp", ".gif", ".bmp", ".tif", ".tiff"}
+    candidates = sorted(bucket_dir.glob(f"{image_stem}.*"))
+    for candidate in candidates:
+        if candidate.suffix.lower() in allowed_exts:
+            return candidate
+    raise FileNotFoundError(f"Image file not found for stem {image_stem!r} in {bucket_dir}")
 
 
 def format_tree_context(

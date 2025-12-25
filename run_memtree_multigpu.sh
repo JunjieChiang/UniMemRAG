@@ -25,7 +25,7 @@ MAX_CONTEXT_CHARS=${MAX_CONTEXT_CHARS:-2048}
 MAX_NEW_TOKENS=${MAX_NEW_TOKENS:-1024}
 SHARD_DIR=${SHARD_DIR:-shards}
 OUTPUT_DIR=${OUTPUT_DIR:-out}
-MERGED_PATH=${MERGED_PATH:-infoseek_memtree_predictions_all_5k_collapsed_beta_0.6_top10.jsonl}
+MERGED_PATH=${MERGED_PATH:-infoseek_memtree_predictions_all_5k_collapsed_beta_0.6_update_top10.jsonl}
 LOG_TO_FILE=${LOG_TO_FILE:-0}
 # ------------------------------------------------
 
