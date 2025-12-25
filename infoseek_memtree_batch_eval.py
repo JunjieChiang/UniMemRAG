@@ -23,6 +23,7 @@ from config import Config
 from unimemrag.embedding.models.ClipEmbedding import ClipEmbedding
 from unimemrag.memory_forest.memory_forest import (
     MemoryForestStore,
+    CollapsedRetrievalResult,
     TreeRetrievalResult,
     build_tree,
     iter_wiki_dict,
@@ -154,7 +155,7 @@ def format_tree_context(
 
 
 def build_context(
-    results: Sequence[TreeRetrievalResult],
+    results: Sequence[Union[TreeRetrievalResult, CollapsedRetrievalResult]],
     *,
     max_trees: int,
     max_sections: int,
@@ -165,7 +166,10 @@ def build_context(
         return ""
     chunks: List[str] = []
     for idx, result in enumerate(results[:max_trees], start=1):
-        chunk = format_tree_context(result, max_sections=max_sections, max_leaves=max_leaves)
+        if isinstance(result, TreeRetrievalResult):
+            chunk = format_tree_context(result, max_sections=max_sections, max_leaves=max_leaves)
+        else:
+            chunk = format_collapsed_context(result, max_sections=max_sections, max_leaves=max_leaves)
         if not chunk:
             continue
         chunks.append(f"[Tree {idx}]\n{chunk}")
@@ -202,15 +206,47 @@ def build_infoseek_message(
     ]
 
 
-def build_retrieval_metadata(results: Sequence[TreeRetrievalResult]) -> Dict[str, Any]:
-    roots = [
-        {
-            "tree_id": res.tree_id,
-            "score": res.root.score,
-            "topic": res.root.payload.get("topic"),
-        }
-        for res in results
+def format_collapsed_context(
+    tree_result: CollapsedRetrievalResult,
+    *,
+    max_sections: int,
+    max_leaves: int,
+) -> str:
+    lines = [
+        f"Tree ID: {tree_result.tree_id}",
     ]
+    for event in tree_result.events[:max_sections]:
+        emeta = event.payload.get("metadata", {}) or {}
+        title = emeta.get("section_title") or event.payload.get("summary") or "Unknown section"
+        lines.append(f"Section: {title}")
+        section_summary = (event.payload.get("summary") or "").strip()
+        if section_summary:
+            lines.append(section_summary)
+        leaf_hits = tree_result.leaves.get(event.id, [])
+        for idx, leaf_hit in enumerate(leaf_hits[:max_leaves], start=1):
+            snippet = (leaf_hit.payload.get("content") or "").strip()
+            if not snippet:
+                continue
+            lines.append(f"Paragraph {idx}: {snippet}")
+        lines.append("")
+    return "\n".join(lines).strip()
+
+
+def build_retrieval_metadata(
+    results: Sequence[Union[TreeRetrievalResult, CollapsedRetrievalResult]],
+) -> Dict[str, Any]:
+    roots: List[Dict[str, Any]] = []
+    for res in results:
+        if isinstance(res, TreeRetrievalResult):
+            roots.append(
+                {
+                    "tree_id": res.tree_id,
+                    "score": res.root.score,
+                    "topic": res.root.payload.get("topic"),
+                }
+            )
+        else:
+            roots.append({"tree_id": res.tree_id, "score": None, "topic": None})
     event_count = sum(len(res.events) for res in results)
     leaf_count = sum(len(leaves) for res in results for leaves in res.leaves.values())
     return {
@@ -281,7 +317,7 @@ def run_infoseek_evaluation(
     batch_size: int = 8,
     root_top_k: int = 3,
     event_top_k: int = 3,
-    leaf_top_k: int = 3,
+    leaf_top_k: int = 10,
     alpha: float = 0.1,
     max_trees: int = 3,
     max_sections: int = 3,
@@ -290,6 +326,7 @@ def run_infoseek_evaluation(
     retrieval_workers: int = 4,
     prefetch_batches: int = 4,
     tqdm_position: int = 0,
+    retrieval_mode: str = "collapsed",
 ) -> Dict[str, Any]:
     if batch_size <= 0:
         raise ValueError("batch_size must be a positive integer.")
@@ -378,15 +415,33 @@ def run_infoseek_evaluation(
             return None
 
         question = example.get("question", "")
-        results = memforest_store.retrieve(
-            embedder,
-            query_text=question,
-            query_image=image_path.as_posix(),
-            root_top_k=root_top_k,
-            event_top_k=event_top_k,
-            leaf_top_k=leaf_top_k,
-            alpha=alpha,
-        )
+        # results = memforest_store.retrieve(
+        #     embedder,
+        #     query_text=question,
+        #     query_image=image_path.as_posix(),
+        #     root_top_k=root_top_k,
+        #     event_top_k=event_top_k,
+        #     leaf_top_k=leaf_top_k,
+        #     alpha=alpha,
+        # )
+        if retrieval_mode == "hierarchical":
+            results = memforest_store.retrieve(
+                embedder,
+                query_text=question,
+                query_image=image_path.as_posix(),
+                root_top_k=root_top_k,
+                event_top_k=event_top_k,
+                leaf_top_k=leaf_top_k,
+                alpha=alpha,
+            )
+        else:
+            results = memforest_store.collapsed_retrieve(
+                embedder,
+                query_text=question,
+                query_image=image_path.as_posix(),
+                leaf_top_k=leaf_top_k,
+                alpha=alpha,
+            )
         context = build_context(
             results,
             max_trees=max_trees,
@@ -484,11 +539,11 @@ def run_infoseek_evaluation(
 
 def main() -> None:
     parser = argparse.ArgumentParser(description="InfoSeek evaluation with MemoryForest retrieval.")
-    parser.add_argument("--dataset", default="../benchmark/infoseek/annotations/infoseek_val.jsonl")
+    parser.add_argument("--dataset", default="../benchmark/infoseek/subset/infoseek_val_5k.jsonl")
     parser.add_argument("--images-root", default=None)
-    parser.add_argument("--save-path", default="infoseek_memtree_predictions.jsonl")
+    parser.add_argument("--save-path", default="infoseek_memtree_predictions_5k_summary.jsonl")
     parser.add_argument("--limit", type=int, default=None)
-    parser.add_argument("--batch-size", type=int, default=25)
+    parser.add_argument("--batch-size", type=int, default=100)
     parser.add_argument("--max-new-tokens", type=int, default=4096)
     parser.add_argument("--collection", default="memtree")
     parser.add_argument("--clip-model", default="../ckpts/clip-vit-base-patch32")
@@ -504,9 +559,15 @@ def main() -> None:
     parser.add_argument("--retrieval-workers", type=int, default=4)
     parser.add_argument("--prefetch-batches", type=int, default=4)
     parser.add_argument("--tqdm-position", type=int, default=0)
+    parser.add_argument(
+        "--retrieval-mode",
+        choices=["collapsed", "hierarchical"],
+        default="collapsed",
+        help="Select retrieval strategy: collapsed (leaf-only) or hierarchical (root->event->leaf).",
+    )
     parser.add_argument("--ingest-kb", action="store_true")
-    parser.add_argument("--kb-path", default="../benchmark/infoseek/wiki_text/wiki_100_dict_v4.json")
-    parser.add_argument("--image-cache-dir", default="../benchmark/infoseek/wiki_text/images_100k")
+    parser.add_argument("--kb-path", default="../benchmark/infoseek/subset/wiki_text/wiki_5k_dict.json")
+    parser.add_argument("--image-cache-dir", default="../benchmark/infoseek/subset/wiki_text/images_5k")
     parser.add_argument("--image-cache-index", default=None)
     parser.add_argument("--download-images", action="store_true")
     parser.add_argument("--ingest-batch-size", type=int, default=256)
@@ -572,6 +633,7 @@ def main() -> None:
         retrieval_workers=args.retrieval_workers,
         prefetch_batches=args.prefetch_batches,
         tqdm_position=args.tqdm_position,
+        retrieval_mode=args.retrieval_mode,
     )
 
     print(results["metrics"])

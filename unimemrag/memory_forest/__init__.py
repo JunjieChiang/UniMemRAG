@@ -6,6 +6,7 @@ from .memory_forest import (
     MemoryTree,
     RetrievalHit,
     TreeRetrievalResult,
+    CollapsedRetrievalResult,
     MemoryForestStore,
 )
 
@@ -17,5 +18,6 @@ __all__ = [
     "MemoryTree",
     "RetrievalHit",
     "TreeRetrievalResult",
+    "CollapsedRetrievalResult",
     "MemoryForestStore",
 ]

@@ -8,7 +8,7 @@ from dataclasses import dataclass, field
 from enum import Enum
 from typing import Any, Callable, Dict, Iterable, List, Optional, Sequence, Tuple, Union
 from concurrent.futures import ThreadPoolExecutor, as_completed
-from tqdm import tqdm
+from tqdm.auto import tqdm
 import numpy as np
 from qdrant_client.http import models as qmodels
 
@@ -77,6 +77,13 @@ class TreeRetrievalResult:
     leaves: Dict[str, List[RetrievalHit]]
 
 
+@dataclass(frozen=True)
+class CollapsedRetrievalResult:
+    tree_id: str
+    events: List[RetrievalHit]
+    leaves: Dict[str, List[RetrievalHit]]
+
+
 class MemoryForestStore(QdrantStore):
     """
     Hierarchical memory structure built on top of QdrantStore.
@@ -93,7 +100,7 @@ class MemoryForestStore(QdrantStore):
         *,
         event_collection: Optional[str] = None,
         leaf_collection: Optional[str] = None,
-        fusion_alpha: float = 0.6,
+        fusion_alpha: float = 0.4,
     ) -> None:
         super().__init__(cfg, vector_size)
         self.event_collection = event_collection or f"{cfg.collection}_events"
@@ -236,6 +243,168 @@ class MemoryForestStore(QdrantStore):
         self._upsert_roots(fused_root_array, root_entries)
         self._upsert_events(event_vectors, event_entries)
         self._upsert_leaves(leaf_vectors, leaf_entries)
+        if embed_progress is not None:
+            embed_progress.close()
+
+        return {
+            "roots": len(root_entries),
+            "events": len(event_entries),
+            "leaves": len(leaf_entries),
+        }
+
+    def ingest_trees_new(
+        self,
+        trees: Sequence[MemoryTree],
+        embedder: ClipEmbedding,
+        *,
+        beta: Optional[float] = None,
+        fusion_fn: Optional[
+            Callable[[np.ndarray, Optional[np.ndarray], MemoryTree], np.ndarray]
+        ] = None,
+        leaf_fusion_fn: Optional[
+            Callable[[np.ndarray, Optional[np.ndarray]], np.ndarray]
+        ] = None,
+        batch_size: int = 32,
+        show_progress: bool = False,
+        text_workers: int = 1,
+        image_workers: int = 1,
+    ) -> Dict[str, Any]:
+        """
+        Index a batch of MemoryTree instances with multimodal leaf fusion.
+
+        - Select an event image using event summary vs section_images (or fallback to root image).
+        - Fuse leaf text with the selected event image to build unified leaf vectors.
+        """
+        if not trees:
+            return {"roots": 0, "events": 0, "leaves": 0}
+
+        processed = [self._normalize_tree(tree) for tree in trees]
+        leaf_entries = self._collect_leaf_entries(processed)
+        event_entries = self._collect_event_entries(processed, leaf_entries)
+        root_entries = self._collect_root_entries(processed, event_entries)
+
+        embed_progress = None
+        if show_progress and tqdm is not None:
+            event_image_candidates = 0
+            for entry in event_entries:
+                candidates = (entry.get("metadata") or {}).get("section_images") or []
+                if isinstance(candidates, str):
+                    event_image_candidates += 1
+                else:
+                    event_image_candidates += len(candidates)
+            total_embeddings = (
+                len(leaf_entries)
+                + len(event_entries)
+                + len(root_entries) * 2
+                + sum(len(entry.get("image_candidates") or []) for entry in root_entries)
+                + event_image_candidates
+            )
+            if total_embeddings > 0:
+                embed_progress = tqdm(
+                    total=total_embeddings,
+                    desc="Embedding Trees (fused leaves)",
+                    leave=False,
+                )
+
+        leaf_text_vectors = self._embed_texts(
+            [entry["text"] for entry in leaf_entries],
+            embedder,
+            batch_size,
+            progress_bar=embed_progress,
+            num_workers=text_workers,
+        )
+        event_vectors = self._embed_texts(
+            [entry["summary"] for entry in event_entries],
+            embedder,
+            batch_size,
+            progress_bar=embed_progress,
+            num_workers=text_workers,
+        )
+        root_text_vectors = self._embed_texts(
+            [entry["topic"] for entry in root_entries],
+            embedder,
+            batch_size,
+            progress_bar=embed_progress,
+            num_workers=text_workers,
+        )
+        alignment_texts = [self._build_root_alignment_text(entry["tree"]) for entry in root_entries]
+        alignment_vectors = self._embed_texts(
+            alignment_texts,
+            embedder,
+            batch_size,
+            progress_bar=embed_progress,
+            num_workers=text_workers,
+        )
+        root_image_vectors = self._select_root_image_vectors(
+            root_entries,
+            embedder,
+            alignment_vectors,
+            image_batch_size=batch_size,
+            image_workers=image_workers,
+            progress_bar=embed_progress,
+        )
+
+        root_image_vectors_by_tree: Dict[str, np.ndarray] = {}
+        root_image_uris_by_tree: Dict[str, Optional[str]] = {}
+        for idx, entry in enumerate(root_entries):
+            tree_id = str(entry["tree_id"])
+            root_image_uris_by_tree[tree_id] = entry.get("image_uri")
+            vec = root_image_vectors.get(idx)
+            if vec is not None:
+                root_image_vectors_by_tree[tree_id] = vec
+
+        event_image_vectors, event_image_uris = self._select_event_image_vectors(
+            event_entries,
+            embedder,
+            event_vectors,
+            root_image_vectors_by_tree,
+            root_image_uris_by_tree,
+            image_batch_size=batch_size,
+            image_workers=image_workers,
+            progress_bar=embed_progress,
+        )
+
+        fused_leaf_vectors: List[np.ndarray] = []
+        for idx, entry in enumerate(leaf_entries):
+            text_vec = leaf_text_vectors[idx] if idx < len(leaf_text_vectors) else None
+            event_id = entry.get("parent_id")
+            tree_id = str(entry.get("tree_id"))
+            image_vec = event_image_vectors.get(str(event_id))
+            image_uri = event_image_uris.get(str(event_id))
+            image_source = "event" if image_uri else None
+            if image_vec is None:
+                image_vec = root_image_vectors_by_tree.get(tree_id)
+                if image_uri is None:
+                    image_uri = root_image_uris_by_tree.get(tree_id)
+                    image_source = "root" if image_uri else None
+            fused_vec = self._build_query_vector(text_vec, image_vec, beta, leaf_fusion_fn)
+            fused_leaf_vectors.append(fused_vec)
+            entry["image_uri"] = image_uri
+            entry["image_source"] = image_source
+
+        fused_leaf_array = (
+            np.vstack(fused_leaf_vectors).astype(np.float32)
+            if fused_leaf_vectors
+            else np.empty((0, embedder.dim), dtype=np.float32)
+        )
+
+        fused_root_vectors = []
+        for idx, entry in enumerate(root_entries):
+            text_vec = root_text_vectors[idx] if len(root_text_vectors) > idx else None
+            image_vec = root_image_vectors.get(idx)
+            fused_vec = self._compose_root_vector(
+                tree=entry["tree"],
+                text_vec=text_vec,
+                image_vec=image_vec,
+                alpha_override=beta,
+                fusion_fn=fusion_fn,
+            )
+            fused_root_vectors.append(fused_vec)
+        fused_root_array = np.vstack(fused_root_vectors).astype(np.float32)
+
+        self._upsert_roots(fused_root_array, root_entries)
+        self._upsert_events(event_vectors, event_entries)
+        self._upsert_leaves_fused(fused_leaf_array, leaf_entries)
         if embed_progress is not None:
             embed_progress.close()
 
@@ -537,6 +706,159 @@ class MemoryForestStore(QdrantStore):
             entry["metadata"] = metadata
         return vectors
 
+    def _select_event_image_vectors(
+        self,
+        event_entries: Sequence[Dict[str, Any]],
+        embedder: ClipEmbedding,
+        event_text_vectors: np.ndarray,
+        root_image_vectors_by_tree: Dict[str, np.ndarray],
+        root_image_uris_by_tree: Dict[str, Optional[str]],
+        *,
+        image_batch_size: int,
+        image_workers: int = 1,
+        progress_bar: Optional[Any] = None,
+    ) -> Tuple[Dict[str, np.ndarray], Dict[str, Optional[str]]]:
+        event_vectors: Dict[str, np.ndarray] = {}
+        event_uris: Dict[str, Optional[str]] = {}
+        if not event_entries:
+            return event_vectors, event_uris
+
+        per_event_candidates: Dict[int, List[str]] = {}
+        flat_urls: List[str] = []
+        flat_meta: List[Tuple[int, int]] = []
+        for idx, entry in enumerate(event_entries):
+            metadata = entry.get("metadata") or {}
+            candidates = metadata.get("section_images") or []
+            if isinstance(candidates, str):
+                candidates = [candidates]
+            candidates = [c for c in candidates if isinstance(c, str) and c]
+            if not candidates:
+                continue
+            per_event_candidates[idx] = candidates
+            for local_idx, url in enumerate(candidates):
+                flat_urls.append(url)
+                flat_meta.append((idx, local_idx))
+
+        per_event_vectors: Dict[int, List[Tuple[int, np.ndarray]]] = defaultdict(list)
+        if flat_urls:
+            batch_size = max(1, image_batch_size)
+            chunk_specs: List[Tuple[List[str], List[Tuple[int, int]]]] = []
+            for start in range(0, len(flat_urls), batch_size):
+                chunk_urls = flat_urls[start : start + batch_size]
+                chunk_meta = flat_meta[start : start + batch_size]
+                chunk_specs.append((chunk_urls, chunk_meta))
+
+            def embed_chunk(
+                urls: List[str],
+                meta: List[Tuple[int, int]],
+            ) -> List[Tuple[Tuple[int, int], np.ndarray]]:
+                results: List[Tuple[Tuple[int, int], np.ndarray]] = []
+                try:
+                    batch_vectors = embedder.embed_images(urls)
+                    results = list(zip(meta, batch_vectors))
+                except Exception as exc:
+                    logger.warning("Batch event image embedding failed: %s", exc)
+                    for meta_item, url in zip(meta, urls):
+                        try:
+                            vec = embedder.embed_images([url])[0]
+                            results.append((meta_item, vec))
+                        except Exception as inner_exc:
+                            logger.error("Failed to embed event image %s: %s", url, inner_exc)
+                return results
+
+            chunk_results: List[List[Tuple[Tuple[int, int], np.ndarray]]] = [
+                list() for _ in range(len(chunk_specs))
+            ]
+            if image_workers <= 1 or len(chunk_specs) <= 1:
+                for idx, (chunk_urls, chunk_meta) in enumerate(chunk_specs):
+                    chunk_results[idx] = embed_chunk(chunk_urls, chunk_meta)
+                    if progress_bar is not None:
+                        progress_bar.update(len(chunk_urls))
+            else:
+                with ThreadPoolExecutor(max_workers=image_workers) as executor:
+                    future_to_idx = {
+                        executor.submit(embed_chunk, chunk_urls, chunk_meta): idx
+                        for idx, (chunk_urls, chunk_meta) in enumerate(chunk_specs)
+                    }
+                    for future in as_completed(future_to_idx):
+                        idx = future_to_idx[future]
+                        chunk_urls, _ = chunk_specs[idx]
+                        try:
+                            chunk_results[idx] = future.result()
+                        except Exception as exc:
+                            logger.exception("Event image embedding worker failed: %s", exc)
+                            chunk_results[idx] = []
+                        if progress_bar is not None:
+                            progress_bar.update(len(chunk_urls))
+
+            for meta_vec_pairs in chunk_results:
+                for (event_idx, local_idx), vec in meta_vec_pairs:
+                    per_event_vectors[event_idx].append((local_idx, vec.astype(np.float32)))
+
+        for idx, entry in enumerate(event_entries):
+            event_id = entry.get("event_id")
+            tree_id = entry.get("tree_id")
+            root_vec = root_image_vectors_by_tree.get(str(tree_id)) if tree_id is not None else None
+            root_uri = root_image_uris_by_tree.get(str(tree_id)) if tree_id is not None else None
+
+            metadata = dict(entry.get("metadata") or {})
+            candidates = per_event_candidates.get(idx, [])
+            candidate_info = per_event_vectors.get(idx, [])
+
+            chosen_vec: Optional[np.ndarray] = None
+            chosen_uri: Optional[str] = None
+            source = None
+            alignment_scores: List[Dict[str, Any]] = []
+
+            if candidates and candidate_info:
+                candidate_info.sort(key=lambda item: item[0])
+                valid_indices: List[int] = []
+                valid_vectors: List[np.ndarray] = []
+                for local_idx, vec in candidate_info:
+                    if float(np.linalg.norm(vec)) > 1e-12:
+                        valid_indices.append(local_idx)
+                        valid_vectors.append(vec)
+                if valid_vectors:
+                    vectors = np.vstack(valid_vectors)
+                    if len(valid_vectors) == 1:
+                        chosen_vec = vectors[0].astype(np.float32)
+                        chosen_uri = candidates[valid_indices[0]]
+                        source = "section"
+                    else:
+                        text_vec = event_text_vectors[idx] if idx < len(event_text_vectors) else None
+                        if text_vec is not None and float(np.linalg.norm(text_vec)) > 1e-12:
+                            scores = vectors @ text_vec
+                            best_local = int(scores.argmax())
+                            chosen_vec = vectors[best_local].astype(np.float32)
+                            chosen_uri = candidates[valid_indices[best_local]]
+                            source = "section"
+                            alignment_scores = [
+                                {"url": candidates[i], "score": float(score)}
+                                for i, score in zip(valid_indices, scores.tolist())
+                                if i < len(candidates)
+                            ]
+                        else:
+                            chosen_vec = vectors[0].astype(np.float32)
+                            chosen_uri = candidates[valid_indices[0]]
+                            source = "section"
+
+            if chosen_vec is None and root_vec is not None:
+                chosen_vec = root_vec.astype(np.float32)
+                chosen_uri = root_uri
+                source = "root"
+
+            if event_id is not None and chosen_vec is not None:
+                event_vectors[str(event_id)] = chosen_vec
+                event_uris[str(event_id)] = chosen_uri
+            if source:
+                metadata["event_image_uri"] = chosen_uri
+                metadata["event_image_source"] = source
+                if alignment_scores:
+                    metadata["event_alignment_scores"] = alignment_scores
+                entry["metadata"] = metadata
+
+        return event_vectors, event_uris
+
     def _compose_root_vector(
         self,
         *,
@@ -629,6 +951,36 @@ class MemoryForestStore(QdrantStore):
                 "parent_id": entry["parent_id"],
                 "content": entry["text"],
             }
+            if entry.get("text_hash"):
+                payload["text_hash"] = entry["text_hash"]
+            if entry["metadata"]:
+                payload["metadata"] = entry["metadata"]
+            payloads.append(payload)
+            ids.append(entry["leaf_id"])
+        self._upsert_to_collection(self.leaf_collection, vectors, payloads, ids)
+
+    def _upsert_leaves_fused(
+        self,
+        vectors: np.ndarray,
+        leaf_entries: Sequence[Dict[str, Any]],
+    ) -> None:
+        if not leaf_entries:
+            return
+        payloads: List[Dict[str, Any]] = []
+        ids: List[str] = []
+        for entry in leaf_entries:
+            image_uri = entry.get("image_uri")
+            payload: Dict[str, Any] = {
+                "modality": "multimodal" if image_uri else "text",
+                "node_type": NodeRole.LEAF.value,
+                "tree_id": entry["tree_id"],
+                "parent_id": entry["parent_id"],
+                "content": entry["text"],
+            }
+            if image_uri:
+                payload["image_uri"] = image_uri
+                if entry.get("image_source"):
+                    payload["image_source"] = entry.get("image_source")
             if entry.get("text_hash"):
                 payload["text_hash"] = entry["text_hash"]
             if entry["metadata"]:
@@ -739,6 +1091,116 @@ class MemoryForestStore(QdrantStore):
                     root=root_hit,
                     events=event_hits,
                     leaves=leaves,
+                )
+            )
+        return results
+
+    def collapsed_retrieve(
+        self,
+        embedder: ClipEmbedding,
+        *,
+        query_text: Optional[str] = None,
+        query_image: Optional[Union[str, bytes, Any]] = None,
+        alpha: Optional[float] = None,
+        fusion_fn: Optional[
+            Callable[[np.ndarray, Optional[np.ndarray]], np.ndarray]
+        ] = None,
+        leaf_top_k: int = 20,
+        leaf_filter: Optional[qmodels.Filter] = None,
+        leaf_score_threshold: Optional[float] = None,
+    ) -> List[CollapsedRetrievalResult]:
+        """
+        Collapsed retrieval: search the leaf collection directly with a fused query,
+        then fold top-k leaf hits into their parent events.
+        """
+        text_vec = (
+            embedder.embed_texts([query_text])[0]
+            if query_text is not None
+            else None
+        )
+        image_vec = (
+            embedder.embed_images([query_image])[0]
+            if query_image is not None
+            else None
+        )
+        if text_vec is None and image_vec is None:
+            raise ValueError("At least one of query_text or query_image must be provided.")
+        if leaf_top_k <= 0:
+            return []
+
+        root_query = self._build_query_vector(text_vec, image_vec, alpha, fusion_fn)
+        leaf_points = self._search_collection(
+            collection_name=self.leaf_collection,
+            query_vec=root_query,
+            top_k=leaf_top_k,
+            filter_=leaf_filter,
+            score_threshold=leaf_score_threshold,
+        )
+        leaf_hits = [self._to_hit(point, NodeRole.LEAF, self.leaf_collection) for point in leaf_points]
+
+        tree_order: List[str] = []
+        tree_to_event_leaves: Dict[str, Dict[str, List[RetrievalHit]]] = defaultdict(dict)
+        event_scores: Dict[str, float] = {}
+        event_ids: List[str] = []
+
+        for hit in leaf_hits:
+            tree_id = hit.payload.get("tree_id")
+            raw_event_id = hit.payload.get("parent_id")
+            if not tree_id or not raw_event_id:
+                continue
+            tree_id = str(tree_id)
+            event_id = str(self._normalize_id(raw_event_id))
+            if tree_id not in tree_order:
+                tree_order.append(tree_id)
+            event_map = tree_to_event_leaves.setdefault(tree_id, {})
+            event_map.setdefault(event_id, []).append(hit)
+            event_scores[event_id] = max(event_scores.get(event_id, 0.0), float(hit.score))
+            if event_id not in event_ids:
+                event_ids.append(event_id)
+
+        event_payloads: Dict[str, Any] = {}
+        if event_ids:
+            try:
+                points = self.client.retrieve(
+                    collection_name=self.event_collection,
+                    ids=event_ids,
+                    with_payload=True,
+                    with_vectors=False,
+                )
+            except Exception as exc:
+                logger.exception("Failed to retrieve event payloads: %s", exc)
+                points = []
+            for point in points:
+                point_id = point.id if isinstance(point.id, str) else str(point.id)
+                payload = getattr(point, "payload", {}) or {}
+                event_payloads[point_id] = dict(payload) if isinstance(payload, dict) else payload
+
+        results: List[CollapsedRetrievalResult] = []
+        for tree_id in tree_order:
+            event_map = tree_to_event_leaves.get(tree_id, {})
+            if not event_map:
+                continue
+            event_hits: List[RetrievalHit] = []
+            leaves_by_event: Dict[str, List[RetrievalHit]] = {}
+            for event_id, leaves in event_map.items():
+                leaves.sort(key=lambda hit: hit.score, reverse=True)
+                payload = event_payloads.get(event_id, {"summary": ""})
+                event_hits.append(
+                    RetrievalHit(
+                        id=event_id,
+                        score=event_scores.get(event_id, 0.0),
+                        payload=payload,
+                        role=NodeRole.EVENT,
+                        collection=self.event_collection,
+                    )
+                )
+                leaves_by_event[event_id] = leaves
+            event_hits.sort(key=lambda hit: hit.score, reverse=True)
+            results.append(
+                CollapsedRetrievalResult(
+                    tree_id=tree_id,
+                    events=event_hits,
+                    leaves=leaves_by_event,
                 )
             )
         return results
@@ -928,6 +1390,72 @@ def summarize_event(paragraph: str) -> str:
     return (sentence if sentence else stripped)[:256]
 
 
+def summarize_event_with_llm(
+    leaf_texts: Sequence[str],
+    *,
+    llm: Any,
+    model: str,
+    section_title: str = "",
+    max_leaf_texts: Optional[int] = None,
+    max_chars_per_leaf: int = 1200,
+    request_kwargs: Optional[Dict[str, Any]] = None,
+) -> str:
+    """
+    Generate an event summary using an OpenAI-compatible client (e.g., DashScope compatible-mode).
+
+    Notes:
+        - The input MUST be the leaf node texts for that section (per design).
+        - ``llm`` is expected to be an ``openai.OpenAI(...)`` client with
+          ``llm.chat.completions.create(model=..., messages=[...], ...)``.
+    """
+    texts = [t.strip() for t in (leaf_texts or []) if isinstance(t, str) and t.strip()]
+    if not texts:
+        return ""
+
+    if max_leaf_texts is not None and max_leaf_texts > 0:
+        texts = texts[:max_leaf_texts]
+
+    clipped: List[str] = []
+    for text in texts:
+        clipped.append(text[:max_chars_per_leaf] if max_chars_per_leaf and max_chars_per_leaf > 0 else text)
+
+    title_part = f"Section title: {section_title.strip()}\n" if section_title and section_title.strip() else ""
+    joined = "\n".join(f"{idx + 1}. {text}" for idx, text in enumerate(clipped))
+    prompt = (
+        "You are a careful summarizer.\n"
+        "Given the following wiki paragraphs (leaf node texts), write a concise summary.\n"
+        "Requirements:\n"
+        "- Output ONLY the summary text, no bullet points, no quotes.\n\n"
+        f"{title_part}"
+        "Paragraphs:\n"
+        f"{joined}\n"
+    )
+
+    messages = [
+        {"role": "system", "content": "You are a helpful summarizer."},
+        {"role": "user", "content": prompt},
+    ]
+    kwargs: Dict[str, Any] = {
+        "max_tokens": 512,
+        "temperature": 0.7,
+        "top_p": 0.9,
+    }
+    if request_kwargs:
+        kwargs.update(request_kwargs)
+
+    resp = llm.chat.completions.create(
+        model=model,
+        messages=messages,
+        **kwargs,
+    )
+    content = ""
+    try:
+        content = resp.choices[0].message.content or ""
+    except Exception:
+        content = str(resp)
+    return str(content).strip()
+
+
 def build_image_index(
     image_urls: Sequence[str],
     image_section_indices: Sequence[int],
@@ -953,14 +1481,22 @@ def build_tree(
     *,
     chunk_size: int = 1024,
     chunk_overlap: int = 120,
-    max_summary_sections: int = 3,
-    show_progress: bool = False,
+    max_summary_sections: Optional[int] = None,
+    llm: Optional[Any] = None,
+    llm_model: str = "qwen-plus",
+    llm_request_kwargs: Optional[Dict[str, Any]] = None,
+    llm_workers: int = 1,
+    show_progress: bool = True,
 ) -> MemoryTree:
     """
     Build a MemoryTree from a wiki-style payload (title, section_texts, images).
 
-    The ``embedder`` argument is retained for backward compatibility but is no longer used;
-    all embedding/vectorization happens during ingestion.
+    If ``llm`` is provided (e.g., ``openai.OpenAI(...)`` client for DashScope compatible-mode),
+    each event summary is generated via ``llm.chat.completions.create(...)`` using the corresponding leaf texts as input. The
+    ``max_summary_sections`` value caps how many leaf texts are included in that prompt
+    (use ``None`` for unlimited).
+
+    Set ``llm_workers>1`` to summarize sections concurrently.
 
     Set ``show_progress=True`` to see a tqdm progress bar over sections (if tqdm is installed).
     """
@@ -1001,16 +1537,26 @@ def build_tree(
     )
 
     section_image_index = build_image_index(image_urls, image_section_indices, section_count)
-    events: List[EventNode] = []
+    event_specs: List[Dict[str, Any]] = []
     leaves: List[LeafNode] = []
 
     section_iter: Iterable[int] = range(section_count)
     if show_progress and tqdm is not None:
+        progress_position = 0
+        instances = getattr(tqdm, "_instances", None)
+        if instances is not None:
+            try:
+                progress_position = len(instances)
+            except TypeError:
+                progress_position = 0
         section_iter = tqdm(
             section_iter,
             desc=f"Sections[{wiki_url}]",
             leave=False,
+            position=progress_position,
         )
+
+    use_llm_concurrency = llm is not None and llm_workers > 1
 
     for sec_idx in section_iter:
         title_clean = section_titles_clean[sec_idx] if sec_idx < len(section_titles_clean) else ""
@@ -1018,7 +1564,6 @@ def build_tree(
         if not title_clean and not text_clean:
             continue
 
-        summary = title_clean or summarize_event(text_clean)
         event_id = f"{wiki_url}::sec{sec_idx}"
         event_metadata: Dict[str, Any] = {
             "section_index": sec_idx,
@@ -1032,6 +1577,7 @@ def build_tree(
             event_metadata.setdefault("section_images", [image_urls[idx] for idx in image_indices])
 
         section_leaf_ids: List[str] = []
+        section_leaf_texts: List[str] = []
         if text_clean:
             paragraphs = list(chunk_paragraphs(text_clean, chunk_size=chunk_size, overlap=chunk_overlap))
             if not paragraphs:
@@ -1042,6 +1588,7 @@ def build_tree(
                     continue
                 leaf_id = f"{event_id}::leaf{para_idx}"
                 section_leaf_ids.append(leaf_id)
+                section_leaf_texts.append(paragraph_clean)
                 text_hash = hashlib.sha1(paragraph_clean.encode("utf-8")).hexdigest()
                 leaves.append(
                     LeafNode(
@@ -1058,14 +1605,105 @@ def build_tree(
                     )
                 )
 
-        events.append(
-            EventNode(
-                summary=summary,
-                parent_id=wiki_url,
-                event_id=event_id,
-                metadata=event_metadata,
-                leaf_ids=tuple(section_leaf_ids),
-            )
+        summary = "" if use_llm_concurrency else summarize_event(text_clean)
+        if llm is not None and section_leaf_texts and llm_workers <= 1:
+            try:
+                llm_summary = summarize_event_with_llm(
+                    section_leaf_texts,
+                    llm=llm,
+                    model=llm_model,
+                    section_title=title_clean,
+                    max_leaf_texts=max_summary_sections,
+                    request_kwargs=llm_request_kwargs,
+                )
+                if llm_summary:
+                    summary = llm_summary
+            except Exception:
+                logger.exception("LLM summarization failed for %s sec=%s; falling back.", wiki_url, sec_idx)
+
+        event_specs.append(
+            {
+                "sec_idx": sec_idx,
+                "event_id": event_id,
+                "event_metadata": event_metadata,
+                "leaf_ids": tuple(section_leaf_ids),
+                "leaf_texts": section_leaf_texts,
+                "fallback_summary": "" if use_llm_concurrency else summary,
+                "fallback_text": text_clean,
+                "section_title": title_clean,
+            }
         )
+
+    summaries: Dict[int, str] = {int(spec["sec_idx"]): str(spec["fallback_summary"] or "") for spec in event_specs}
+    if llm is not None and llm_workers > 1:
+        summary_progress = None
+        if show_progress and tqdm is not None:
+            total_summaries = sum(1 for spec in event_specs if spec.get("leaf_texts"))
+            if total_summaries > 0:
+                progress_position = 0
+                instances = getattr(tqdm, "_instances", None)
+                if instances is not None:
+                    try:
+                        progress_position = len(instances)
+                    except TypeError:
+                        progress_position = 0
+                summary_progress = tqdm(
+                    total=total_summaries,
+                    desc=f"Summaries[{wiki_url}]",
+                    leave=False,
+                    position=progress_position,
+                )
+        max_workers = max(1, int(llm_workers))
+        try:
+            with ThreadPoolExecutor(max_workers=max_workers) as executor:
+                future_to_sec: Dict[Any, int] = {}
+                for spec in event_specs:
+                    leaf_texts = spec.get("leaf_texts") or []
+                    if not leaf_texts:
+                        continue
+                    sec_idx = int(spec["sec_idx"])
+                    future = executor.submit(
+                        summarize_event_with_llm,
+                        leaf_texts,
+                        llm=llm,
+                        model=llm_model,
+                        section_title=str(spec.get("section_title") or ""),
+                        max_leaf_texts=max_summary_sections,
+                        request_kwargs=llm_request_kwargs,
+                    )
+                    future_to_sec[future] = sec_idx
+
+                for future in as_completed(future_to_sec):
+                    sec_idx = future_to_sec[future]
+                    try:
+                        llm_summary = future.result()
+                        if llm_summary:
+                            summaries[sec_idx] = llm_summary
+                    except Exception:
+                        logger.exception("LLM summarization failed for %s sec=%s; falling back.", wiki_url, sec_idx)
+                    if summary_progress is not None:
+                        summary_progress.update(1)
+        finally:
+            if summary_progress is not None:
+                summary_progress.close()
+
+        for spec in event_specs:
+            sec_idx = int(spec["sec_idx"])
+            if summaries.get(sec_idx):
+                continue
+            fallback_text = str(spec.get("fallback_text") or "")
+            if fallback_text:
+                summaries[sec_idx] = summarize_event(fallback_text)
+
+    events: List[EventNode] = [
+        EventNode(
+            summary=summaries.get(int(spec["sec_idx"]), ""),
+            parent_id=wiki_url,
+            event_id=str(spec["event_id"]),
+            metadata=dict(spec["event_metadata"]),
+            leaf_ids=spec["leaf_ids"],
+        )
+        for spec in event_specs
+    ]
 
     return MemoryTree(tree_id=wiki_url, root=root, events=events, leaves=leaves)
