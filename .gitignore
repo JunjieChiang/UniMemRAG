@@ -47,6 +47,7 @@ qdrant
 examples/results/
 *.jsonl
 *.json
+*.csv
 
 # Notebook artifacts
 .ipynb_checkpoints/
