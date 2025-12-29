@@ -7,25 +7,26 @@ set -euo pipefail
 # ---------------- user settings ----------------
 GPU_IDS=(${GPU_IDS:-0 1})
 DATASET=${DATASET:-../benchmark/infoseek/subset/infoseek_val_5k.jsonl}
-IMAGES_ROOT=${IMAGES_ROOT:-}
+IMAGES_ROOT=${IMAGES_ROOT:-../benchmark/oven}
+IMAGE_INDEX_CSV=${IMAGE_INDEX_CSV:-infoseek_image_index.csv}
 COLLECTION=${COLLECTION:-memtree}
 CLIP_MODEL=${CLIP_MODEL:-../ckpts/clip-vit-base-patch32}
 VLM_MODEL=${VLM_MODEL:-../ckpts/Qwen2.5-VL-7B-Instruct}
 BATCH_SIZE=${BATCH_SIZE:-1}
 PREFETCH_BATCHES=${PREFETCH_BATCHES:-1}
-RETRIEVAL_WORKERS=${RETRIEVAL_WORKERS:-1}
+RETRIEVAL_WORKERS=${RETRIEVAL_WORKERS:-4}
 ROOT_TOP_K=${ROOT_TOP_K:-3}
 EVENT_TOP_K=${EVENT_TOP_K:-3}
 LEAF_TOP_K=${LEAF_TOP_K:-5}
 ALPHA=${ALPHA:-0.1}
-MAX_TREES=${MAX_TREES:-3}
-MAX_SECTIONS=${MAX_SECTIONS:-3}
-MAX_LEAVES=${MAX_LEAVES:-2}
-MAX_CONTEXT_CHARS=${MAX_CONTEXT_CHARS:-2048}
-MAX_NEW_TOKENS=${MAX_NEW_TOKENS:-1024}
+MAX_TREES=${MAX_TREES:-5}
+MAX_SECTIONS=${MAX_SECTIONS:-5}
+MAX_LEAVES=${MAX_LEAVES:-5}
+MAX_CONTEXT_CHARS=${MAX_CONTEXT_CHARS:-32768}
+MAX_NEW_TOKENS=${MAX_NEW_TOKENS:-512}
 SHARD_DIR=${SHARD_DIR:-shards}
 OUTPUT_DIR=${OUTPUT_DIR:-out}
-MERGED_PATH=${MERGED_PATH:-infoseek_memtree_predictions_all_5k_collapsed_beta_0.6_update_top10.jsonl}
+MERGED_PATH=${MERGED_PATH:-infoseek_memtree_predictions_all_5k_collapsed_beta_0.4_update_top10.jsonl}
 LOG_TO_FILE=${LOG_TO_FILE:-0}
 # ------------------------------------------------
 
@@ -79,6 +80,9 @@ for idx in "${!SHARDS[@]}"; do
   )
   if [[ -n "${IMAGES_ROOT}" ]]; then
     cmd+=(--images-root "${IMAGES_ROOT}")
+  fi
+  if [[ -n "${IMAGE_INDEX_CSV}" ]]; then
+    cmd+=(--image-index-csv "${IMAGE_INDEX_CSV}")
   fi
 
   if [[ "${LOG_TO_FILE}" -eq 1 ]]; then

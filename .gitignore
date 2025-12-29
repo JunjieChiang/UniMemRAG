@@ -24,8 +24,10 @@ env/
 *.log
 log/
 examples/log/
+results/
 
 # Data, checkpoints, and vector indexes
+shards/
 storage/
 snapshots/
 out/

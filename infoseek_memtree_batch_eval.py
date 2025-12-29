@@ -8,12 +8,13 @@ For index has not built:
 
 
 import argparse
+import csv
 import json
 import os
 import re
 import queue
 from pathlib import Path
-from typing import Any, Dict, List, Optional, Sequence, Union
+from typing import Any, Dict, List, Optional, Sequence, Tuple, Union
 from concurrent.futures import ThreadPoolExecutor
 
 import torch
@@ -35,6 +36,9 @@ from unimemrag.utils.image_cache import (
     save_image_cache,
 )
 from unimemrag.vlm.QwenVL import QwenVL
+from infoseek_image_utils import ALLOWED_IMAGE_EXTS, resolve_images_root
+
+_IMAGE_INDEX_CACHE: Dict[Tuple[Path, Path], Dict[str, Path]] = {}
 
 
 def _disable_proxies() -> None:
@@ -94,9 +98,35 @@ def match_answer(
     return _quick_match(prediction, gold_answers)
 
 
+def _load_image_index(images_root: Path, image_index_csv: Path) -> Dict[str, Path]:
+    cache_key = (images_root, image_index_csv)
+    cached = _IMAGE_INDEX_CACHE.get(cache_key)
+    if cached is not None:
+        return cached
+
+    mapping: Dict[str, Path] = {}
+    with image_index_csv.open("r", encoding="utf-8", newline="") as f:
+        reader = csv.DictReader(f)
+        if not reader.fieldnames or "image_id" not in reader.fieldnames or "relative_path" not in reader.fieldnames:
+            raise ValueError(f"Image index CSV must contain 'image_id' and 'relative_path' columns: {image_index_csv}")
+        for row in reader:
+            image_id = Path((row.get("image_id") or "").strip()).stem
+            rel_path_str = (row.get("relative_path") or "").strip()
+            if not image_id or not rel_path_str:
+                continue
+            rel_path = Path(rel_path_str)
+            if rel_path.suffix.lower() not in ALLOWED_IMAGE_EXTS:
+                continue
+            mapping[image_id] = rel_path
+
+    _IMAGE_INDEX_CACHE[cache_key] = mapping
+    return mapping
+
+
 def resolve_infoseek_image(
     image_id: Union[str, Path],
     images_root: Optional[Union[str, Path]] = None,
+    image_index_csv: Optional[Union[str, Path]] = None,
 ) -> Path:
     image_stem = Path(image_id).stem
     id_parts = image_stem.split("_")
@@ -105,20 +135,27 @@ def resolve_infoseek_image(
 
     bucket = id_parts[1][:2]
 
-    if images_root is None:
-        base_dir = Path(__file__).resolve().parent
-        images_root = (base_dir / "../benchmark/oven/").resolve()
-    else:
-        images_root = Path(images_root).expanduser().resolve()
+    images_root = resolve_images_root(images_root)
+
+    if image_index_csv:
+        image_index_path = Path(image_index_csv).expanduser()
+        if not image_index_path.exists():
+            raise FileNotFoundError(f"Image index CSV not found: {image_index_path}")
+        index = _load_image_index(images_root, image_index_path)
+        rel_path = index.get(image_stem)
+        if rel_path:
+            abs_path = (images_root / rel_path).resolve()
+            if abs_path.exists():
+                return abs_path
+            raise FileNotFoundError(f"Indexed image path not found: {abs_path}")
 
     bucket_dir = images_root / bucket
     if not bucket_dir.exists():
         raise FileNotFoundError(f"Image bucket not found: {bucket_dir}")
 
-    allowed_exts = {".jpg", ".jpeg", ".png", ".webp", ".gif", ".bmp", ".tif", ".tiff"}
     candidates = sorted(bucket_dir.glob(f"{image_stem}.*"))
     for candidate in candidates:
-        if candidate.suffix.lower() in allowed_exts:
+        if candidate.suffix.lower() in ALLOWED_IMAGE_EXTS:
             return candidate
     raise FileNotFoundError(f"Image file not found for stem {image_stem!r} in {bucket_dir}")
 
@@ -315,6 +352,7 @@ def run_infoseek_evaluation(
     *,
     limit: Optional[int] = None,
     images_root: Optional[Union[str, Path]] = None,
+    image_index_csv: Optional[Union[str, Path]] = None,
     save_path: Optional[Union[str, Path]] = None,
     show_progress: bool = True,
     max_new_tokens: int = 4096,
@@ -412,7 +450,11 @@ def run_infoseek_evaluation(
 
     def _prepare_example(example: Dict[str, Any]) -> Optional[Dict[str, Any]]:
         try:
-            image_path = resolve_infoseek_image(example["image_id"], images_root=images_root)
+            image_path = resolve_infoseek_image(
+                example["image_id"],
+                images_root=images_root,
+                image_index_csv=image_index_csv,
+            )
         except FileNotFoundError as exc:
             data_id = example.get("data_id") or example.get("image_id") or "unknown"
             _log(f"Skipping {data_id}: {exc}")
@@ -544,8 +586,9 @@ def run_infoseek_evaluation(
 def main() -> None:
     parser = argparse.ArgumentParser(description="InfoSeek evaluation with MemoryForest retrieval.")
     parser.add_argument("--dataset", default="../benchmark/infoseek/subset/infoseek_val_5k.jsonl")
-    parser.add_argument("--images-root", default=None)
-    parser.add_argument("--save-path", default="infoseek_memtree_predictions_5k_summary.jsonl")
+    parser.add_argument("--images-root", default="../benchmark/oven")
+    parser.add_argument("--image-index-csv", default="infoseek_image_index.csv", help="CSV mapping image_id to relative_path under images-root.")
+    parser.add_argument("--save-path", default="infoseek_memtree_predictions_test.jsonl")
     parser.add_argument("--limit", type=int, default=None)
     parser.add_argument("--batch-size", type=int, default=100)
     parser.add_argument("--max-new-tokens", type=int, default=4096)
@@ -559,7 +602,7 @@ def main() -> None:
     parser.add_argument("--max-trees", type=int, default=3)
     parser.add_argument("--max-sections", type=int, default=3)
     parser.add_argument("--max-leaves", type=int, default=2)
-    parser.add_argument("--max-context-chars", type=int, default=2048)
+    parser.add_argument("--max-context-chars", type=int, default=32768)
     parser.add_argument("--retrieval-workers", type=int, default=4)
     parser.add_argument("--prefetch-batches", type=int, default=4)
     parser.add_argument("--tqdm-position", type=int, default=0)
@@ -623,6 +666,7 @@ def main() -> None:
         dataset,
         limit=args.limit,
         images_root=args.images_root,
+        image_index_csv=args.image_index_csv,
         save_path=args.save_path,
         max_new_tokens=args.max_new_tokens,
         batch_size=args.batch_size,

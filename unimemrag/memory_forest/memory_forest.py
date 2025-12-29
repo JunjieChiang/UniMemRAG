@@ -1,7 +1,9 @@
 from __future__ import annotations
 
+import csv
 import hashlib
 import logging
+import os
 import uuid
 from pathlib import Path
 from collections import defaultdict
@@ -19,7 +21,62 @@ from unimemrag.vector_store.qdrant import QdrantStore
 
 logger = logging.getLogger(__name__)
 
-_ALLOWED_IMAGE_EXTS = {".jpg", ".jpeg", ".png", ".webp", ".gif", ".bmp", ".tif", ".tiff"}
+_ALLOWED_IMAGE_EXTS = {".jpg", ".jpeg"}
+_IMAGE_INDEX_CACHE: Dict[Tuple[Path, Path], Dict[str, Path]] = {}
+_REPO_ROOT = Path(__file__).resolve().parents[2]
+
+INFOSEEK_IMAGES_ROOT = "benchmark/oven"
+INFOSEEK_IMAGE_INDEX_CSV = "infoseek_image_index.csv"
+
+
+def _resolve_infoseek_path(path_value: Union[str, Path]) -> Path:
+    path = Path(path_value).expanduser()
+    if path.is_absolute():
+        return path
+    if path.exists():
+        return path.resolve()
+    return (_REPO_ROOT / path).resolve()
+
+
+def _get_infoseek_images_root() -> Optional[Path]:
+    images_root = INFOSEEK_IMAGES_ROOT
+    if not images_root:
+        return None
+    return _resolve_infoseek_path(images_root)
+
+
+def _get_infoseek_image_index_csv() -> Optional[Path]:
+    csv_path = INFOSEEK_IMAGE_INDEX_CSV
+    if not csv_path:
+        return None
+    return _resolve_infoseek_path(csv_path)
+
+
+def _load_image_index(images_root: Path, image_index_csv: Path) -> Dict[str, Path]:
+    cache_key = (images_root, image_index_csv)
+    cached = _IMAGE_INDEX_CACHE.get(cache_key)
+    if cached is not None:
+        return cached
+
+    mapping: Dict[str, Path] = {}
+    with image_index_csv.open("r", encoding="utf-8", newline="") as f:
+        reader = csv.DictReader(f)
+        if not reader.fieldnames or "image_id" not in reader.fieldnames or "relative_path" not in reader.fieldnames:
+            raise ValueError(
+                f"Image index CSV must contain 'image_id' and 'relative_path' columns: {image_index_csv}"
+            )
+        for row in reader:
+            image_id = Path((row.get("image_id") or "").strip()).stem
+            rel_path_str = (row.get("relative_path") or "").strip()
+            if not image_id or not rel_path_str:
+                continue
+            rel_path = Path(rel_path_str)
+            if rel_path.suffix.lower() not in _ALLOWED_IMAGE_EXTS:
+                continue
+            mapping[image_id] = rel_path
+
+    _IMAGE_INDEX_CACHE[cache_key] = mapping
+    return mapping
 
 
 def _resolve_query_image_path(query_image: Union[str, Path, Any]) -> Union[str, Any]:
@@ -28,15 +85,31 @@ def _resolve_query_image_path(query_image: Union[str, Path, Any]) -> Union[str, 
     if isinstance(query_image, str) and query_image.startswith(("http://", "https://")):
         return query_image
     path = Path(query_image)
+    if path.is_absolute():
+        if path.exists():
+            return path.as_posix()
+        raise FileNotFoundError(f"Query image not found: {path}")
     if path.exists():
-        return path.as_posix()
-    parent = path.parent
-    if not parent.exists():
-        return query_image
-    for candidate in sorted(parent.glob(f"{path.stem}.*")):
-        if candidate.suffix.lower() in _ALLOWED_IMAGE_EXTS:
-            return candidate.as_posix()
-    return query_image if isinstance(query_image, str) else path.as_posix()
+        return path.resolve().as_posix()
+
+    images_root = _get_infoseek_images_root()
+    image_index_csv = _get_infoseek_image_index_csv()
+    if not image_index_csv:
+        raise FileNotFoundError("Image index CSV is required but not set in INFOSEEK_IMAGE_INDEX_CSV/IMAGE_INDEX_CSV.")
+    if not image_index_csv.exists():
+        raise FileNotFoundError(f"Image index CSV not found: {image_index_csv}")
+    if images_root is None:
+        raise FileNotFoundError("Images root is required but not set in INFOSEEK_IMAGES_ROOT/IMAGES_ROOT.")
+
+    index = _load_image_index(images_root, image_index_csv)
+    rel_path = index.get(path.stem)
+    if not rel_path:
+        raise FileNotFoundError(f"Image id not found in CSV index: {path.stem!r}")
+    abs_path = rel_path if rel_path.is_absolute() else (images_root / rel_path)
+    abs_path = abs_path.resolve()
+    if abs_path.exists():
+        return abs_path.as_posix()
+    raise FileNotFoundError(f"Indexed image path not found: {abs_path}")
 
 
 class NodeRole(str, Enum):
