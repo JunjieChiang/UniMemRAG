@@ -1,5 +1,8 @@
 #!/usr/bin/env bash
 # Sweep beta values, build index, run eval for each LEAF_TOP_K, then delete index.
+'''
+BETAS="0.1 0.2 0.3 0.4 0.5 0.6 0.7 0.8 0.9 1.0" LEAF_TOP_KS="5 10" SLEEP_SECS=180 bash run_memtree_beta_sweep.sh
+'''
 
 set -euo pipefail
 
@@ -7,7 +10,8 @@ ROOT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 cd "${ROOT_DIR}"
 
 # ---------------- user settings (override via env) ----------------
-GPU_IDS="${GPU_IDS:-0 1 2 3 4 5 6 7}"
+# GPU_IDS="${GPU_IDS:-0 1 2 3 4 5 6 7}"
+GPU_IDS="${GPU_IDS:-0 4}"
 LEAF_TOP_KS="${LEAF_TOP_KS:-5 10}"
 BETAS="${BETAS:-}"  # Optional explicit list, e.g. "0.0 0.1 0.2"
 BETA_START="${BETA_START:-0.0}"
@@ -17,21 +21,27 @@ SLEEP_SECS="${SLEEP_SECS:-60}"
 
 TREES_JSON="${TREES_JSON:-examples/trees_5k.json}"
 COLLECTION="${COLLECTION:-memtree}"
-CLIP_MODEL="${CLIP_MODEL:-../ckpts/clip-vit-base-patch32}"
-INGEST_BATCH_SIZE="${INGEST_BATCH_SIZE:-512}"
-TEXT_WORKERS="${TEXT_WORKERS:-16}"
-IMAGE_WORKERS="${IMAGE_WORKERS:-16}"
-
+CLIP_MODEL="${CLIP_MODEL:-../ckpts/EVA-CLIP-8B}"
+LEAF_TEXT_MODEL="${LEAF_TEXT_MODEL:-../ckpts/Qwen3-Embedding-0.6B}"
+LEAF_TEXT_DEVICE="${LEAF_TEXT_DEVICE:-cuda:auto}"
+INGEST_BATCH_SIZE="${INGEST_BATCH_SIZE:-2}"
+TEXT_WORKERS="${TEXT_WORKERS:-1}"
+IMAGE_WORKERS="${IMAGE_WORKERS:-1}"
+TEXT_BATCH_SIZE="${TEXT_BATCH_SIZE:-2}"
+LEAF_TEXT_WORKERS="${LEAF_TEXT_WORKERS:-${TEXT_WORKERS}}"
+ANSWER_MODE="${ANSWER_MODE:-vlm}"
+TEXT_MODEL="${TEXT_MODEL:-../ckpts/Qwen2.5-VL-7B-Instruct}"
+TRUST_REMOTE_CODE="${TRUST_REMOTE_CODE:-1}"
 DATASET="${DATASET:-../benchmark/infoseek/subset/infoseek_val_5k.jsonl}"
 IMAGES_ROOT="${IMAGES_ROOT:-../benchmark/oven}"
 IMAGE_INDEX_CSV="${IMAGE_INDEX_CSV:-infoseek_image_index.csv}"
 VLM_MODEL="${VLM_MODEL:-../ckpts/Qwen2.5-VL-7B-Instruct}"
-BATCH_SIZE="${BATCH_SIZE:-4}"
-PREFETCH_BATCHES="${PREFETCH_BATCHES:-4}"
-RETRIEVAL_WORKERS="${RETRIEVAL_WORKERS:-8}"
+BATCH_SIZE="${BATCH_SIZE:-1}"
+PREFETCH_BATCHES="${PREFETCH_BATCHES:-1}"
+RETRIEVAL_WORKERS="${RETRIEVAL_WORKERS:-2}"
 ROOT_TOP_K="${ROOT_TOP_K:-3}"
 EVENT_TOP_K="${EVENT_TOP_K:-3}"
-ALPHA="${ALPHA:-0.1}"
+ALPHA="${ALPHA:-0.05}"
 MAX_TREES="${MAX_TREES:-5}"
 MAX_SECTIONS="${MAX_SECTIONS:-5}"
 MAX_LEAVES="${MAX_LEAVES:-5}"
@@ -73,6 +83,8 @@ build_index() {
   local beta="$1"
   BETA="${beta}" TREES_JSON="${TREES_JSON}" COLLECTION="${COLLECTION}" CLIP_MODEL="${CLIP_MODEL}" \
   INGEST_BATCH_SIZE="${INGEST_BATCH_SIZE}" TEXT_WORKERS="${TEXT_WORKERS}" IMAGE_WORKERS="${IMAGE_WORKERS}" \
+  LEAF_TEXT_MODEL="${LEAF_TEXT_MODEL}" LEAF_TEXT_DEVICE="${LEAF_TEXT_DEVICE}" \
+  LEAF_TEXT_WORKERS="${LEAF_TEXT_WORKERS}" TEXT_BATCH_SIZE="${TEXT_BATCH_SIZE}" \
   python - <<'PY'
 import json
 import os
@@ -87,6 +99,7 @@ sys.path.append(os.getcwd())
 
 from config import Config
 from unimemrag.retriever import ClipEmbedding
+from unimemrag.embedding.models.QwenTextEmbedding import QwenTextEmbedding
 from unimemrag.memory_forest.memory_forest import MemoryForestStore, MemoryTree, RootNode, EventNode, LeafNode
 
 trees_path = Path(os.environ["TREES_JSON"]).expanduser()
@@ -95,7 +108,18 @@ if not trees_path.exists():
 
 cfg = Config(collection=os.environ["COLLECTION"])
 embed_model = ClipEmbedding(model_name=os.environ["CLIP_MODEL"])
-memforest_store = MemoryForestStore(cfg, vector_size=embed_model.dim)
+leaf_text_model = os.environ.get("LEAF_TEXT_MODEL") or ""
+leaf_text_device = os.environ.get("LEAF_TEXT_DEVICE") or None
+leaf_text_embedder = None
+leaf_text_vector_size = None
+if leaf_text_model:
+    leaf_text_embedder = QwenTextEmbedding(model_name=leaf_text_model, device=leaf_text_device)
+    leaf_text_vector_size = leaf_text_embedder.dim
+memforest_store = MemoryForestStore(
+    cfg,
+    vector_size=embed_model.dim,
+    leaf_text_vector_size=leaf_text_vector_size,
+)
 
 with trees_path.open("r", encoding="utf-8") as fh:
     data = json.load(fh)
@@ -109,13 +133,18 @@ def tree_from_dict(d):
 trees = [tree_from_dict(x) for x in data]
 
 beta = float(os.environ["BETA"])
+text_batch_size = os.environ.get("TEXT_BATCH_SIZE") or ""
+text_batch_size = int(text_batch_size) if text_batch_size else None
 memforest_store.ingest_trees_new(
     trees,
     embed_model,
     beta=beta,
     batch_size=int(os.environ["INGEST_BATCH_SIZE"]),
+    text_batch_size=text_batch_size,
     text_workers=int(os.environ["TEXT_WORKERS"]),
     image_workers=int(os.environ["IMAGE_WORKERS"]),
+    leaf_text_embedder=leaf_text_embedder,
+    leaf_text_workers=int(os.environ["LEAF_TEXT_WORKERS"]),
     show_progress=True,
 )
 PY
@@ -190,7 +219,9 @@ for beta in "${BETAS_LIST[@]}"; do
     LEAF_TOP_K="${leaf_top_k}" MERGED_PATH="${merged_path}" SHARD_DIR="${shard_dir}" \
     OUTPUT_DIR="${output_dir}" DATASET="${DATASET}" IMAGES_ROOT="${IMAGES_ROOT}" \
     IMAGE_INDEX_CSV="${IMAGE_INDEX_CSV}" COLLECTION="${COLLECTION}" CLIP_MODEL="${CLIP_MODEL}" \
-    VLM_MODEL="${VLM_MODEL}" ROOT_TOP_K="${ROOT_TOP_K}" EVENT_TOP_K="${EVENT_TOP_K}" \
+    LEAF_TEXT_MODEL="${LEAF_TEXT_MODEL}" LEAF_TEXT_DEVICE="${LEAF_TEXT_DEVICE}" \
+    VLM_MODEL="${VLM_MODEL}" ANSWER_MODE="${ANSWER_MODE}" TEXT_MODEL="${TEXT_MODEL}" \
+    TRUST_REMOTE_CODE="${TRUST_REMOTE_CODE}" ROOT_TOP_K="${ROOT_TOP_K}" EVENT_TOP_K="${EVENT_TOP_K}" \
     ALPHA="${ALPHA}" MAX_TREES="${MAX_TREES}" MAX_SECTIONS="${MAX_SECTIONS}" \
     MAX_LEAVES="${MAX_LEAVES}" MAX_CONTEXT_CHARS="${MAX_CONTEXT_CHARS}" \
     MAX_NEW_TOKENS="${MAX_NEW_TOKENS}" LOG_TO_FILE="${LOG_TO_FILE}" \

@@ -25,6 +25,7 @@ env/
 log/
 examples/log/
 results/
+benchmark/
 
 # Data, checkpoints, and vector indexes
 shards/

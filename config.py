@@ -12,7 +12,7 @@ class Config:
 
     distance: qmodels.Distance = qmodels.Distance.COSINE
     on_disk: bool = True
-    batch_size: int = 1024
+    batch_size: int = 512
 
     top_k: int = 5
     timeout_sec = 1200

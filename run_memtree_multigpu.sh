@@ -1,6 +1,47 @@
 #!/usr/bin/env bash
 # Multi-GPU launcher for infoseek_memtree_batch_eval.py
 # Customise variables below or override via env (e.g., GPU_IDS="0 1" BATCH_SIZE=1 ./run_memtree_multigpu.sh)
+'''
+1) For Qwen2.5 text mode evaluation on Infoseek 5k subset with 8 GPUs:
+
+  GPU_IDS="0 1 2 3 4 5 6 7" \
+  NUM_SHARDS=8 \
+  ANSWER_MODE=text \
+  DATASET=../benchmark/infoseek/subset/infoseek_val_5k.jsonl \
+  IMAGES_ROOT=../benchmark/oven \
+  IMAGE_INDEX_CSV=infoseek_image_index.csv \
+  COLLECTION=memtree \
+  TEXT_MODEL=../ckpts/Qwen2.5-7B \
+  BATCH_SIZE=2 \
+  PREFETCH_BATCHES=2 \
+  RETRIEVAL_WORKERS=4 \
+  LEAF_TOP_K=10 \
+  ALPHA=0.1 \
+  MERGED_PATH=infoseek_memtree_predictions_5k.jsonl \
+  ./run_memtree_multigpu.sh
+
+2) For VLM mode evaluation on Infoseek 5k subset with 8 GPUs:
+
+  GPU_IDS="0 1 2 3 4 5 6 7" \
+  NUM_SHARDS=8 \
+  ANSWER_MODE=vlm \
+  DATASET=../benchmark/infoseek/subset/infoseek_val_5k.jsonl \
+  IMAGES_ROOT=../benchmark/oven \
+  IMAGE_INDEX_CSV=infoseek_image_index.csv \
+  COLLECTION=memtree \
+  CLIP_MODEL=../ckpts/clip-vit-base-patch32 \
+  VLM_MODEL=../ckpts/Qwen2.5-VL-7B-Instruct \
+  LEAF_TEXT_MODEL=../ckpts/Qwen3-Embedding-0.6B \
+  LEAF_TEXT_DEVICE=cuda:2 \
+  RETRIEVAL_MODE=collapsed \
+  BATCH_SIZE=2 \
+  PREFETCH_BATCHES=2 \
+  RETRIEVAL_WORKERS=4 \
+  LEAF_TOP_K=10 \
+  ALPHA=0.1 \
+  MERGED_PATH=infoseek_memtree_predictions_vlm_5k_leaf_text_embedding.jsonl \
+  ./run_memtree_multigpu.sh
+'''
 
 set -euo pipefail
 
@@ -11,7 +52,12 @@ IMAGES_ROOT=${IMAGES_ROOT:-../benchmark/oven}
 IMAGE_INDEX_CSV=${IMAGE_INDEX_CSV:-infoseek_image_index.csv}
 COLLECTION=${COLLECTION:-memtree}
 CLIP_MODEL=${CLIP_MODEL:-../ckpts/clip-vit-base-patch32}
+LEAF_TEXT_MODEL=${LEAF_TEXT_MODEL:-../ckpts/Qwen3-Embedding-0.6B}
+LEAF_TEXT_DEVICE=${LEAF_TEXT_DEVICE:-}
 VLM_MODEL=${VLM_MODEL:-../ckpts/Qwen2.5-VL-7B-Instruct}
+ANSWER_MODE=${ANSWER_MODE:-vlm}
+TEXT_MODEL=${TEXT_MODEL:-../ckpts/Qwen3-Embedding-0.6B}
+TRUST_REMOTE_CODE=${TRUST_REMOTE_CODE:-0}
 BATCH_SIZE=${BATCH_SIZE:-1}
 PREFETCH_BATCHES=${PREFETCH_BATCHES:-1}
 RETRIEVAL_WORKERS=${RETRIEVAL_WORKERS:-4}
@@ -67,6 +113,7 @@ for idx in "${!SHARDS[@]}"; do
     --collection "${COLLECTION}"
     --clip-model "${CLIP_MODEL}"
     --vlm-model "${VLM_MODEL}"
+    --answer-mode "${ANSWER_MODE}"
     --root-top-k "${ROOT_TOP_K}"
     --event-top-k "${EVENT_TOP_K}"
     --leaf-top-k "${LEAF_TOP_K}"
@@ -83,6 +130,18 @@ for idx in "${!SHARDS[@]}"; do
   fi
   if [[ -n "${IMAGE_INDEX_CSV}" ]]; then
     cmd+=(--image-index-csv "${IMAGE_INDEX_CSV}")
+  fi
+  if [[ "${ANSWER_MODE}" == "text" ]]; then
+    cmd+=(--text-model "${TEXT_MODEL}")
+    if [[ "${TRUST_REMOTE_CODE}" -eq 1 ]]; then
+      cmd+=(--trust-remote-code)
+    fi
+  fi
+  if [[ -n "${LEAF_TEXT_MODEL}" ]]; then
+    cmd+=(--leaf-text-model "${LEAF_TEXT_MODEL}")
+  fi
+  if [[ -n "${LEAF_TEXT_DEVICE}" ]]; then
+    cmd+=(--leaf-text-device "${LEAF_TEXT_DEVICE}")
   fi
 
   if [[ "${LOG_TO_FILE}" -eq 1 ]]; then

@@ -14,6 +14,7 @@ from concurrent.futures import ThreadPoolExecutor, as_completed
 from tqdm.auto import tqdm
 import numpy as np
 from qdrant_client.http import models as qmodels
+from qdrant_client.http.exceptions import UnexpectedResponse
 
 from unimemrag.embedding.models.ClipEmbedding import ClipEmbedding
 from unimemrag.vector_store.qdrant import QdrantStore
@@ -25,7 +26,7 @@ _ALLOWED_IMAGE_EXTS = {".jpg", ".jpeg"}
 _IMAGE_INDEX_CACHE: Dict[Tuple[Path, Path], Dict[str, Path]] = {}
 _REPO_ROOT = Path(__file__).resolve().parents[2]
 
-INFOSEEK_IMAGES_ROOT = "benchmark/oven"
+INFOSEEK_IMAGES_ROOT = "../benchmark/oven"
 INFOSEEK_IMAGE_INDEX_CSV = "infoseek_image_index.csv"
 
 
@@ -194,14 +195,36 @@ class MemoryForestStore(QdrantStore):
         event_collection: Optional[str] = None,
         leaf_collection: Optional[str] = None,
         fusion_alpha: float = 0.4,
+        leaf_text_vector_size: Optional[int] = None,
+        leaf_vector_name: str = "clip",
+        leaf_text_vector_name: str = "text",
     ) -> None:
         super().__init__(cfg, vector_size)
         self.event_collection = event_collection or f"{cfg.collection}_events"
         self.leaf_collection = leaf_collection or f"{cfg.collection}_leaves"
         self.fusion_alpha = fusion_alpha
+        self.leaf_vector_name = leaf_vector_name
+        self.leaf_text_vector_name = leaf_text_vector_name
+        self.leaf_text_vector_size = leaf_text_vector_size
+        self.leaf_has_named_vectors = leaf_text_vector_size is not None
+
+        leaf_vectors_config = None
+        if self.leaf_has_named_vectors:
+            leaf_vectors_config = {
+                self.leaf_vector_name: qmodels.VectorParams(
+                    size=vector_size,
+                    distance=self.cfg.distance,
+                    on_disk=self.cfg.on_disk,
+                ),
+                self.leaf_text_vector_name: qmodels.VectorParams(
+                    size=int(leaf_text_vector_size),
+                    distance=self.cfg.distance,
+                    on_disk=self.cfg.on_disk,
+                ),
+            }
 
         self._ensure_named_collection(self.event_collection, vector_size)
-        self._ensure_named_collection(self.leaf_collection, vector_size)
+        self._ensure_named_collection(self.leaf_collection, vector_size, vectors_config=leaf_vectors_config)
         self._ensure_payload_indexes_for_collection(
             self.event_collection, ["modality", "tree_id", "node_type", "parent_id"]
         )
@@ -210,16 +233,23 @@ class MemoryForestStore(QdrantStore):
         )
 
     # ------------------------------------------------------------------ creation utils
-    def _ensure_named_collection(self, collection_name: str, vector_size: int) -> None:
+    def _ensure_named_collection(
+        self,
+        collection_name: str,
+        vector_size: int,
+        *,
+        vectors_config: Optional[Union[qmodels.VectorParams, Dict[str, qmodels.VectorParams]]] = None,
+    ) -> None:
         collections = {c.name for c in self.client.get_collections().collections}
         if collection_name not in collections:
+            vectors_config = vectors_config or qmodels.VectorParams(
+                size=vector_size,
+                distance=self.cfg.distance,
+                on_disk=self.cfg.on_disk,
+            )
             self.client.create_collection(
                 collection_name=collection_name,
-                vectors_config=qmodels.VectorParams(
-                    size=vector_size,
-                    distance=self.cfg.distance,
-                    on_disk=self.cfg.on_disk,
-                ),
+                vectors_config=vectors_config,
                 optimizers_config=qmodels.OptimizersConfigDiff(indexing_threshold=20000),
             )
 
@@ -358,23 +388,41 @@ class MemoryForestStore(QdrantStore):
             Callable[[np.ndarray, Optional[np.ndarray]], np.ndarray]
         ] = None,
         batch_size: int = 32,
+        text_batch_size: Optional[int] = None,
         show_progress: bool = False,
         text_workers: int = 1,
         image_workers: int = 1,
+        leaf_text_embedder: Optional[Any] = None,
+        leaf_text_workers: int = 2,
     ) -> Dict[str, Any]:
         """
         Index a batch of MemoryTree instances with multimodal leaf fusion.
 
         - Select an event image using event summary vs section_images (or fallback to root image).
         - Fuse leaf text with the selected event image to build unified leaf vectors.
+        - Optionally store a text-only leaf embedding (requires leaf collection named vectors).
         """
         if not trees:
             return {"roots": 0, "events": 0, "leaves": 0}
+
+        if leaf_text_embedder is not None and not self.leaf_has_named_vectors:
+            raise ValueError(
+                "leaf_text_vector_size must be set on MemoryForestStore to store text-only leaf vectors."
+            )
+        if leaf_text_embedder is not None and self.leaf_text_vector_size is not None:
+            embedder_dim = getattr(leaf_text_embedder, "dim", None)
+            if embedder_dim is not None and int(embedder_dim) != int(self.leaf_text_vector_size):
+                raise ValueError(
+                    f"Leaf text embedder dim {embedder_dim} does not match "
+                    f"leaf_text_vector_size={self.leaf_text_vector_size}."
+                )
 
         processed = [self._normalize_tree(tree) for tree in trees]
         leaf_entries = self._collect_leaf_entries(processed)
         event_entries = self._collect_event_entries(processed, leaf_entries)
         root_entries = self._collect_root_entries(processed, event_entries)
+        mm_batch_size = batch_size
+        text_batch_size = text_batch_size or mm_batch_size
 
         embed_progress = None
         if show_progress and tqdm is not None:
@@ -392,6 +440,8 @@ class MemoryForestStore(QdrantStore):
                 + sum(len(entry.get("image_candidates") or []) for entry in root_entries)
                 + event_image_candidates
             )
+            if leaf_text_embedder is not None:
+                total_embeddings += len(leaf_entries)
             if total_embeddings > 0:
                 embed_progress = tqdm(
                     total=total_embeddings,
@@ -402,21 +452,21 @@ class MemoryForestStore(QdrantStore):
         leaf_text_vectors = self._embed_texts(
             [entry["text"] for entry in leaf_entries],
             embedder,
-            batch_size,
+            mm_batch_size,
             progress_bar=embed_progress,
             num_workers=text_workers,
         )
         event_vectors = self._embed_texts(
             [entry["summary"] for entry in event_entries],
             embedder,
-            batch_size,
+            mm_batch_size,
             progress_bar=embed_progress,
             num_workers=text_workers,
         )
         root_text_vectors = self._embed_texts(
             [entry["topic"] for entry in root_entries],
             embedder,
-            batch_size,
+            mm_batch_size,
             progress_bar=embed_progress,
             num_workers=text_workers,
         )
@@ -424,7 +474,7 @@ class MemoryForestStore(QdrantStore):
         alignment_vectors = self._embed_texts(
             alignment_texts,
             embedder,
-            batch_size,
+            mm_batch_size,
             progress_bar=embed_progress,
             num_workers=text_workers,
         )
@@ -432,7 +482,7 @@ class MemoryForestStore(QdrantStore):
             root_entries,
             embedder,
             alignment_vectors,
-            image_batch_size=batch_size,
+            image_batch_size=mm_batch_size,
             image_workers=image_workers,
             progress_bar=embed_progress,
         )
@@ -452,7 +502,7 @@ class MemoryForestStore(QdrantStore):
             event_vectors,
             root_image_vectors_by_tree,
             root_image_uris_by_tree,
-            image_batch_size=batch_size,
+            image_batch_size=mm_batch_size,
             image_workers=image_workers,
             progress_bar=embed_progress,
         )
@@ -481,6 +531,16 @@ class MemoryForestStore(QdrantStore):
             else np.empty((0, embedder.dim), dtype=np.float32)
         )
 
+        leaf_text_only_vectors = None
+        if leaf_text_embedder is not None:
+            leaf_text_only_vectors = self._embed_texts(
+                [entry["text"] for entry in leaf_entries],
+                leaf_text_embedder,
+                text_batch_size,
+                progress_bar=embed_progress,
+                num_workers=leaf_text_workers,
+            )
+
         fused_root_vectors = []
         for idx, entry in enumerate(root_entries):
             text_vec = root_text_vectors[idx] if len(root_text_vectors) > idx else None
@@ -497,7 +557,7 @@ class MemoryForestStore(QdrantStore):
 
         self._upsert_roots(fused_root_array, root_entries)
         self._upsert_events(event_vectors, event_entries)
-        self._upsert_leaves_fused(fused_leaf_array, leaf_entries)
+        self._upsert_leaves_fused(fused_leaf_array, leaf_entries, text_vectors=leaf_text_only_vectors)
         if embed_progress is not None:
             embed_progress.close()
 
@@ -636,7 +696,7 @@ class MemoryForestStore(QdrantStore):
         for idx, event in enumerate(tree.events):
             summary = (event.summary or "").strip()
             if summary:
-                pieces.append(summary[:512])
+                pieces.append(summary)
             if idx + 1 >= max_sections:
                 break
         return " ".join(pieces).strip()
@@ -1056,6 +1116,8 @@ class MemoryForestStore(QdrantStore):
         self,
         vectors: np.ndarray,
         leaf_entries: Sequence[Dict[str, Any]],
+        *,
+        text_vectors: Optional[np.ndarray] = None,
     ) -> None:
         if not leaf_entries:
             return
@@ -1080,7 +1142,24 @@ class MemoryForestStore(QdrantStore):
                 payload["metadata"] = entry["metadata"]
             payloads.append(payload)
             ids.append(entry["leaf_id"])
-        self._upsert_to_collection(self.leaf_collection, vectors, payloads, ids)
+        if text_vectors is None:
+            self._upsert_to_collection(self.leaf_collection, vectors, payloads, ids)
+            return
+        if len(text_vectors) != len(vectors):
+            raise ValueError("Leaf text vectors must match fused leaf vectors.")
+        points: List[qmodels.PointStruct] = []
+        for fused_vec, text_vec, payload, point_id in zip(vectors, text_vectors, payloads, ids):
+            points.append(
+                qmodels.PointStruct(
+                    id=self._normalize_id(point_id),
+                    vector={
+                        self.leaf_vector_name: fused_vec.tolist(),
+                        self.leaf_text_vector_name: text_vec.tolist(),
+                    },
+                    payload=payload,
+                )
+            )
+        self._upsert_points(self.leaf_collection, points)
 
     def _upsert_to_collection(
         self,
@@ -1100,11 +1179,39 @@ class MemoryForestStore(QdrantStore):
                     payload=payload,
                 )
             )
-        # self.client.upsert(collection_name=collection_name, points=points, wait=False)
+        self._upsert_points(collection_name, points)
+
+    def _upsert_points(self, collection_name: str, points: Sequence[qmodels.PointStruct]) -> None:
+        if not points:
+            return
         batch_size = max(1, getattr(self.cfg, "batch_size", 10000) or 10000)  # smaller batch to avoid timeouts
         for i in range(0, len(points), batch_size):
             batch = points[i : i + batch_size]
-            self.client.upsert(collection_name=collection_name, points=batch, wait=False)
+            self._upsert_points_batch(collection_name, batch)
+
+    def _upsert_points_batch(
+        self,
+        collection_name: str,
+        points: Sequence[qmodels.PointStruct],
+    ) -> None:
+        try:
+            self.client.upsert(collection_name=collection_name, points=points, wait=False)
+        except UnexpectedResponse as exc:
+            if self._is_payload_too_large(exc) and len(points) > 1:
+                mid = len(points) // 2
+                self._upsert_points_batch(collection_name, points[:mid])
+                self._upsert_points_batch(collection_name, points[mid:])
+                return
+            raise
+
+    @staticmethod
+    def _is_payload_too_large(exc: UnexpectedResponse) -> bool:
+        if exc.status_code != 400:
+            return False
+        content = exc.content
+        if isinstance(content, (bytes, bytearray)):
+            content = content.decode("utf-8", "ignore")
+        return "Payload error: JSON payload" in str(content)
 
     # ------------------------------------------------------------------ retrieval
     def retrieve(
@@ -1196,6 +1303,7 @@ class MemoryForestStore(QdrantStore):
         *,
         query_text: Optional[str] = None,
         query_image: Optional[Union[str, bytes, Any]] = None,
+        leaf_text_embedder: Optional[Any] = None,
         alpha: Optional[float] = None,
         fusion_fn: Optional[
             Callable[[np.ndarray, Optional[np.ndarray]], np.ndarray]
@@ -1205,8 +1313,10 @@ class MemoryForestStore(QdrantStore):
         leaf_score_threshold: Optional[float] = None,
     ) -> List[CollapsedRetrievalResult]:
         """
-        Collapsed retrieval: search the leaf collection directly with a fused query,
-        then fold top-k leaf hits into their parent events.
+        Collapsed retrieval with two stages:
+        1) Global leaf search to find candidate trees.
+        2) Per-tree leaf search within candidates to gather top-k leaves and events.
+           If ``leaf_text_embedder`` is provided, stage 2 uses text-only leaf vectors.
         """
         text_vec = (
             embedder.embed_texts([query_text])[0]
@@ -1226,34 +1336,92 @@ class MemoryForestStore(QdrantStore):
             return []
 
         root_query = self._build_query_vector(text_vec, image_vec, alpha, fusion_fn)
-        leaf_points = self._search_collection(
+
+        if leaf_text_embedder is not None and not self.leaf_has_named_vectors:
+            raise ValueError(
+                "leaf_text_vector_size must be set on MemoryForestStore to query text-only leaf vectors."
+            )
+        if leaf_text_embedder is not None and self.leaf_text_vector_size is not None:
+            embedder_dim = getattr(leaf_text_embedder, "dim", None)
+            if embedder_dim is not None and int(embedder_dim) != int(self.leaf_text_vector_size):
+                raise ValueError(
+                    f"Leaf text embedder dim {embedder_dim} does not match "
+                    f"leaf_text_vector_size={self.leaf_text_vector_size}."
+                )
+        text_query_vec = None
+        if leaf_text_embedder is not None and query_text is not None:
+            text_query_vec = leaf_text_embedder.embed_texts([query_text])[0]
+
+        # Stage 1: global leaf search to locate candidate trees.
+        stage1_points = self._search_collection(
             collection_name=self.leaf_collection,
             query_vec=root_query,
             top_k=leaf_top_k,
             filter_=leaf_filter,
             score_threshold=leaf_score_threshold,
+            vector_name=self.leaf_vector_name if self.leaf_has_named_vectors else None,
         )
-        leaf_hits = [self._to_hit(point, NodeRole.LEAF, self.leaf_collection) for point in leaf_points]
+        stage1_hits = [self._to_hit(point, NodeRole.LEAF, self.leaf_collection) for point in stage1_points]
+        print("Collapsed retrieval stage 1 results", stage1_hits)
 
         tree_order: List[str] = []
+        tree_scores: Dict[str, float] = {}
+        for hit in stage1_hits:
+            tree_id = hit.payload.get("tree_id")
+            if not tree_id:
+                continue
+            tree_id = str(tree_id)
+            if tree_id not in tree_order:
+                tree_order.append(tree_id)
+            tree_scores[tree_id] = max(tree_scores.get(tree_id, 0.0), float(hit.score))
+
+        if not tree_order:
+            return []
+
+        tree_order.sort(key=lambda tree_id: tree_scores.get(tree_id, 0.0), reverse=True)
+
+        # Stage 2: search leaves within each candidate tree.
         tree_to_event_leaves: Dict[str, Dict[str, List[RetrievalHit]]] = defaultdict(dict)
         event_scores: Dict[str, float] = {}
         event_ids: List[str] = []
 
-        for hit in leaf_hits:
-            tree_id = hit.payload.get("tree_id")
-            raw_event_id = hit.payload.get("parent_id")
-            if not tree_id or not raw_event_id:
+        stage2_query_vec = text_query_vec if text_query_vec is not None else root_query
+        stage2_vector_name = (
+            self.leaf_text_vector_name
+            if text_query_vec is not None
+            else (self.leaf_vector_name if self.leaf_has_named_vectors else None)
+        )
+        for tree_id in tree_order:
+            base_filter = qmodels.Filter(
+                must=[
+                    qmodels.FieldCondition(
+                        key="tree_id",
+                        match=qmodels.MatchValue(value=tree_id),
+                    )
+                ]
+            )
+            merged_filter = self._merge_filters(base_filter, leaf_filter)
+            leaf_points = self._search_collection(
+                collection_name=self.leaf_collection,
+                query_vec=stage2_query_vec,
+                top_k=leaf_top_k,
+                filter_=merged_filter,
+                score_threshold=leaf_score_threshold,
+                vector_name=stage2_vector_name,
+            )
+            leaf_hits = [self._to_hit(point, NodeRole.LEAF, self.leaf_collection) for point in leaf_points]
+            if not leaf_hits:
                 continue
-            tree_id = str(tree_id)
-            event_id = str(self._normalize_id(raw_event_id))
-            if tree_id not in tree_order:
-                tree_order.append(tree_id)
             event_map = tree_to_event_leaves.setdefault(tree_id, {})
-            event_map.setdefault(event_id, []).append(hit)
-            event_scores[event_id] = max(event_scores.get(event_id, 0.0), float(hit.score))
-            if event_id not in event_ids:
-                event_ids.append(event_id)
+            for hit in leaf_hits:
+                raw_event_id = hit.payload.get("parent_id")
+                if not raw_event_id:
+                    continue
+                event_id = str(self._normalize_id(raw_event_id))
+                event_map.setdefault(event_id, []).append(hit)
+                event_scores[event_id] = max(event_scores.get(event_id, 0.0), float(hit.score))
+                if event_id not in event_ids:
+                    event_ids.append(event_id)
 
         event_payloads: Dict[str, Any] = {}
         if event_ids:
@@ -1300,6 +1468,8 @@ class MemoryForestStore(QdrantStore):
                     leaves=leaves_by_event,
                 )
             )
+        
+        print("Collapsed retrieval final results:", results)
         return results
 
     def _build_query_vector(
@@ -1399,6 +1569,7 @@ class MemoryForestStore(QdrantStore):
                 top_k=top_k,
                 filter_=leaf_filter,
                 score_threshold=score_threshold,
+                vector_name=self.leaf_vector_name if self.leaf_has_named_vectors else None,
             )
             leaf_hits = [self._to_hit(point, NodeRole.LEAF, self.leaf_collection) for point in points]
             if leaf_hits:
@@ -1413,11 +1584,15 @@ class MemoryForestStore(QdrantStore):
         top_k: int,
         filter_: Optional[qmodels.Filter],
         score_threshold: Optional[float],
+        vector_name: Optional[str] = None,
     ) -> List[qmodels.ScoredPoint]:
         assert query_vec.ndim == 1, "query_vec must be 1D for search"
+        query_vector = query_vec.astype(np.float32).tolist()
+        if vector_name:
+            query_vector = qmodels.NamedVector(name=vector_name, vector=query_vector)
         return self.client.search(
             collection_name=collection_name,
-            query_vector=query_vec.astype(np.float32).tolist(),
+            query_vector=query_vector,
             query_filter=filter_,
             limit=top_k,
             score_threshold=score_threshold,
@@ -1484,7 +1659,7 @@ def summarize_event(paragraph: str) -> str:
     if not stripped:
         return ""
     sentence = stripped.split(".", 1)[0]
-    return (sentence if sentence else stripped)[:256]
+    return (sentence if sentence else stripped)
 
 
 def summarize_event_with_llm(

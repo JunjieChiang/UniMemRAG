@@ -19,9 +19,11 @@ from concurrent.futures import ThreadPoolExecutor
 
 import torch
 from tqdm import tqdm
+from transformers import AutoModelForCausalLM, AutoTokenizer
 
 from config import Config
 from unimemrag.embedding.models.ClipEmbedding import ClipEmbedding
+from unimemrag.embedding.models.QwenTextEmbedding import QwenTextEmbedding
 from unimemrag.memory_forest.memory_forest import (
     MemoryForestStore,
     CollapsedRetrievalResult,
@@ -225,8 +227,10 @@ def build_context(
 
 def build_infoseek_message(
     question: str,
-    image_path: Union[str, Path],
     context: str,
+    image_path: Optional[Union[str, Path]] = None,
+    *,
+    include_image: bool = True,
 ) -> List[Dict[str, Any]]:
     if context:
         prompt = f"Here's the context:\n{context}\n\nNow, answer the question:\n{question}"
@@ -235,16 +239,79 @@ def build_infoseek_message(
         prompt = f"Answer the question:\n{question}"
         system_text = "You are a helpful assistant. Please answer the user's question."
 
+    if include_image and image_path is not None:
+        return [
+            {"role": "system", "content": system_text},
+            {
+                "role": "user",
+                "content": [
+                    {"type": "image", "image": Path(image_path).as_posix()},
+                    {"type": "text", "text": prompt},
+                ],
+            },
+        ]
     return [
         {"role": "system", "content": system_text},
-        {
-            "role": "user",
-            "content": [
-                {"type": "image", "image": Path(image_path).as_posix()},
-                {"type": "text", "text": prompt},
-            ],
-        },
+        {"role": "user", "content": prompt},
     ]
+
+
+class Qwen:
+    def __init__(
+        self,
+        model_name: str,
+        *,
+        torch_dtype: str = "auto",
+        device_map: str = "auto",
+        trust_remote_code: bool = False,
+    ) -> None:
+        self.tokenizer = AutoTokenizer.from_pretrained(model_name, trust_remote_code=trust_remote_code)
+        self.model = AutoModelForCausalLM.from_pretrained(
+            model_name,
+            torch_dtype=torch_dtype,
+            device_map=device_map,
+            trust_remote_code=trust_remote_code,
+        )
+        if self.tokenizer.pad_token_id is None:
+            self.tokenizer.pad_token_id = self.tokenizer.eos_token_id
+
+    def chat(self, messages: List[Dict[str, Any]], *, max_new_tokens: int) -> str:
+        return self.chat_batch([messages], max_new_tokens=max_new_tokens)[0]
+
+    def chat_batch(
+        self,
+        messages_list: List[List[Dict[str, Any]]],
+        *,
+        max_new_tokens: int,
+    ) -> List[str]:
+        prompts = [
+            self.tokenizer.apply_chat_template(
+                messages,
+                tokenize=False,
+                add_generation_prompt=True,
+            )
+            for messages in messages_list
+        ]
+        model_inputs = self.tokenizer(prompts, return_tensors="pt", padding=True).to(self.model.device)
+        attention_mask = model_inputs.get("attention_mask")
+        input_ids = model_inputs["input_ids"]
+
+        with torch.inference_mode():
+            generated_ids = self.model.generate(
+                **model_inputs,
+                max_new_tokens=max_new_tokens,
+                pad_token_id=self.tokenizer.pad_token_id,
+            )
+
+        outputs: List[str] = []
+        for idx in range(generated_ids.size(0)):
+            if attention_mask is not None:
+                input_len = int(attention_mask[idx].sum().item())
+            else:
+                input_len = int(input_ids.shape[1])
+            output_ids = generated_ids[idx][input_len:].tolist()
+            outputs.append(self.tokenizer.decode(output_ids, skip_special_tokens=True))
+        return outputs
 
 
 def format_collapsed_context(
@@ -301,6 +368,7 @@ def build_retrieval_metadata(
 def maybe_ingest_kb(
     store: MemoryForestStore,
     embedder: ClipEmbedding,
+    leaf_text_embedder: Optional[QwenTextEmbedding],
     *,
     kb_path: Path,
     image_cache_dir: Path,
@@ -309,6 +377,7 @@ def maybe_ingest_kb(
     ingest_batch_size: int,
     text_workers: int,
     image_workers: int,
+    leaf_text_workers: Optional[int],
     alpha: float,
     show_progress: bool,
 ) -> None:
@@ -333,21 +402,24 @@ def maybe_ingest_kb(
         payload = localize_payload(payload)
         trees.append(build_tree(wiki_url, payload))
 
-    store.ingest_trees(
+    store.ingest_trees_new(
         trees,
         embedder,
+        beta=alpha,
         batch_size=ingest_batch_size,
         text_workers=text_workers,
         image_workers=image_workers,
-        alpha=alpha,
+        leaf_text_embedder=leaf_text_embedder,
+        leaf_text_workers=leaf_text_workers or text_workers,
         show_progress=show_progress,
     )
 
 
 def run_infoseek_evaluation(
-    vlm: QwenVL,
+    answer_model: Any,
     memforest_store: MemoryForestStore,
     embedder: ClipEmbedding,
+    leaf_text_embedder: Optional[QwenTextEmbedding],
     dataset: Sequence[Dict[str, Any]],
     *,
     limit: Optional[int] = None,
@@ -369,6 +441,7 @@ def run_infoseek_evaluation(
     prefetch_batches: int = 4,
     tqdm_position: int = 0,
     retrieval_mode: str = "collapsed",
+    include_images_in_messages: bool = True,
 ) -> Dict[str, Any]:
     if batch_size <= 0:
         raise ValueError("batch_size must be a positive integer.")
@@ -399,16 +472,16 @@ def run_infoseek_evaluation(
             return
 
         try:
-            if len(pending_messages) > 1 and hasattr(vlm, "chat_batch"):
-                predictions = vlm.chat_batch(pending_messages, max_new_tokens=max_new_tokens)
+            if len(pending_messages) > 1 and hasattr(answer_model, "chat_batch"):
+                predictions = answer_model.chat_batch(pending_messages, max_new_tokens=max_new_tokens)
             else:
-                predictions = [vlm.chat(pending_messages[0], max_new_tokens=max_new_tokens)]
+                predictions = [answer_model.chat(pending_messages[0], max_new_tokens=max_new_tokens)]
         except Exception as exc:
             _log(f"Batch inference failed ({exc}); falling back to sequential execution.")
             predictions = []
             for item, messages in zip(pending_examples, pending_messages):
                 try:
-                    predictions.append(vlm.chat(messages, max_new_tokens=max_new_tokens))
+                    predictions.append(answer_model.chat(messages, max_new_tokens=max_new_tokens))
                 except Exception as inner_exc:
                     example = item.get("example", {})
                     data_id = example.get("data_id") or example.get("image_id") or "unknown"
@@ -432,7 +505,7 @@ def run_infoseek_evaluation(
                 prediction,
                 gold_candidates,
                 question=example.get("question"),
-                judge_vlm=vlm,
+                judge_vlm=answer_model,
             )
 
             record = dict(example)
@@ -485,6 +558,7 @@ def run_infoseek_evaluation(
                 embedder,
                 query_text=question,
                 query_image=image_path.as_posix(),
+                leaf_text_embedder=leaf_text_embedder,
                 leaf_top_k=leaf_top_k,
                 alpha=alpha,
             )
@@ -495,7 +569,12 @@ def run_infoseek_evaluation(
             max_leaves=max_leaves,
             max_chars=max_context_chars,
         )
-        messages = build_infoseek_message(question, image_path=image_path, context=context)
+        messages = build_infoseek_message(
+            question,
+            context=context,
+            image_path=image_path,
+            include_image=include_images_in_messages,
+        )
         retrieval_meta = build_retrieval_metadata(results)
         return {
             "example": example,
@@ -588,13 +667,25 @@ def main() -> None:
     parser.add_argument("--dataset", default="../benchmark/infoseek/subset/infoseek_val_5k.jsonl")
     parser.add_argument("--images-root", default="../benchmark/oven")
     parser.add_argument("--image-index-csv", default="infoseek_image_index.csv", help="CSV mapping image_id to relative_path under images-root.")
-    parser.add_argument("--save-path", default="infoseek_memtree_predictions_test.jsonl")
+    parser.add_argument("--save-path", default="infoseek_memtree_predictions_test_qwen2.5.jsonl")
     parser.add_argument("--limit", type=int, default=None)
     parser.add_argument("--batch-size", type=int, default=100)
     parser.add_argument("--max-new-tokens", type=int, default=4096)
     parser.add_argument("--collection", default="memtree")
     parser.add_argument("--clip-model", default="../ckpts/clip-vit-base-patch32")
     parser.add_argument("--vlm-model", default="../ckpts/Qwen2.5-VL-7B-Instruct")
+    parser.add_argument("--text-model", default="../ckpts/Qwen2.5-7B-Instruct")
+    parser.add_argument(
+        "--answer-mode",
+        choices=["vlm", "text"],
+        default="vlm",
+        help="Select answer model: vlm (QwenVL) or text (Qwen2.5-7B).",
+    )
+    parser.add_argument(
+        "--trust-remote-code",
+        action="store_true",
+        help="Enable trust_remote_code for transformers models.",
+    )
     parser.add_argument("--root-top-k", type=int, default=3)
     parser.add_argument("--event-top-k", type=int, default=3)
     parser.add_argument("--leaf-top-k", type=int, default=3)
@@ -620,6 +711,12 @@ def main() -> None:
     parser.add_argument("--ingest-batch-size", type=int, default=256)
     parser.add_argument("--text-workers", type=int, default=16)
     parser.add_argument("--image-workers", type=int, default=16)
+    parser.add_argument("--leaf-text-model", default=None, help="Optional text embedding model for stage-2 leaf search.")
+    parser.add_argument(
+        "--leaf-text-device",
+        default="cuda:auto",
+        help="Device for leaf text embedding model (e.g., cuda:auto, auto, cuda:1, cpu).",
+    )
     args = parser.parse_args()
 
     _disable_proxies()
@@ -627,8 +724,22 @@ def main() -> None:
     dataset = load_infoseek_dataset(args.dataset)
 
     cfg = Config(collection=args.collection)
-    embedder = ClipEmbedding(model_name=args.clip_model)
-    memforest_store = MemoryForestStore(cfg, vector_size=embedder.dim)
+    # embedder = ClipEmbedding(model_name=args.clip_model, device_map="balanced", image_processor_name_or_path="../ckpts/clip-vit-large-patch14")
+    embedder = ClipEmbedding(model_name=args.clip_model, image_processor_name_or_path="../ckpts/clip-vit-large-patch14", device="cuda:auto")
+    leaf_text_embedder: Optional[QwenTextEmbedding] = None
+    leaf_text_vector_size: Optional[int] = None
+    if args.leaf_text_model:
+        leaf_text_embedder = QwenTextEmbedding(
+            model_name=args.leaf_text_model,
+            device=args.leaf_text_device,
+            # model_kwargs={'device_map': "balanced"}
+        )
+        leaf_text_vector_size = leaf_text_embedder.dim
+    memforest_store = MemoryForestStore(
+        cfg,
+        vector_size=embedder.dim,
+        leaf_text_vector_size=leaf_text_vector_size,
+    )
 
     if args.ingest_kb:
         kb_path = Path(args.kb_path).expanduser()
@@ -641,6 +752,7 @@ def main() -> None:
         maybe_ingest_kb(
             memforest_store,
             embedder,
+            leaf_text_embedder,
             kb_path=kb_path,
             image_cache_dir=image_cache_dir,
             image_cache_index=image_cache_index,
@@ -648,21 +760,33 @@ def main() -> None:
             ingest_batch_size=args.ingest_batch_size,
             text_workers=args.text_workers,
             image_workers=args.image_workers,
+            leaf_text_workers=args.text_workers,
             alpha=args.alpha,
             show_progress=True,
         )
 
-    vlm = QwenVL(
-        model_path=args.vlm_model,
-        torch_dtype="auto",
-        device_map="auto",
-        attn_implementation="flash_attention_2",
-    )
+    if args.answer_mode == "text":
+        answer_model = Qwen(
+            args.text_model,
+            torch_dtype="auto",
+            device_map="auto",
+            trust_remote_code=args.trust_remote_code,
+        )
+        include_images_in_messages = False
+    else:
+        answer_model = QwenVL(
+            model_path=args.vlm_model,
+            torch_dtype="auto",
+            device_map="auto",
+            attn_implementation="flash_attention_2",
+        )
+        include_images_in_messages = True
 
     results = run_infoseek_evaluation(
-        vlm,
+        answer_model,
         memforest_store,
         embedder,
+        leaf_text_embedder,
         dataset,
         limit=args.limit,
         images_root=args.images_root,
@@ -682,6 +806,7 @@ def main() -> None:
         prefetch_batches=args.prefetch_batches,
         tqdm_position=args.tqdm_position,
         retrieval_mode=args.retrieval_mode,
+        include_images_in_messages=include_images_in_messages,
     )
 
     print(results["metrics"])

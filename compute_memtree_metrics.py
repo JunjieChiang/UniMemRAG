@@ -1,25 +1,6 @@
 #!/usr/bin/env python3
 '''
-python ./compute_memtree_metrics.py --files infoseek_memtree_predictions_all_5k_collapsed_beta_0.0_update_top5.jsonl \
-        infoseek_memtree_predictions_all_5k_collapsed_beta_0.0_update_top10.jsonl \
-        infoseek_memtree_predictions_all_5k_collapsed_beta_0.1_update_top5.jsonl \
-        infoseek_memtree_predictions_all_5k_collapsed_beta_0.1_update_top10.jsonl \
-        infoseek_memtree_predictions_all_5k_collapsed_beta_0.2_update_top5.jsonl \
-        infoseek_memtree_predictions_all_5k_collapsed_beta_0.2_update_top10.jsonl \
-        infoseek_memtree_predictions_all_5k_collapsed_beta_0.3_update_top5.jsonl \
-        infoseek_memtree_predictions_all_5k_collapsed_beta_0.3_update_top10.jsonl \
-        infoseek_memtree_predictions_all_5k_collapsed_beta_0.4_update_top5.jsonl \
-        infoseek_memtree_predictions_all_5k_collapsed_beta_0.4_update_top10.jsonl \
-        infoseek_memtree_predictions_all_5k_collapsed_beta_0.5_update_top5.jsonl \
-        infoseek_memtree_predictions_all_5k_collapsed_beta_0.5_update_top10.jsonl \
-        infoseek_memtree_predictions_all_5k_collapsed_beta_0.6_update_top5.jsonl  \
-        infoseek_memtree_predictions_all_5k_collapsed_beta_0.6_update_top10.jsonl \
-        infoseek_memtree_predictions_all_5k_collapsed_beta_0.7_update_top5.jsonl \
-        infoseek_memtree_predictions_all_5k_collapsed_beta_0.7_update_top10.jsonl \
-        infoseek_memtree_predictions_all_5k_collapsed_beta_0.8_update_top5.jsonl \
-        infoseek_memtree_predictions_all_5k_collapsed_beta_0.8_update_top10.jsonl \
-        infoseek_memtree_predictions_all_5k_collapsed_beta_0.9_update_top5.jsonl \
-        infoseek_memtree_predictions_all_5k_collapsed_beta_0.9_update_top10.jsonl
+python compute_memtree_metrics.py --dir results/v4_leaf_retrieval_vit_l_p14_text_embedding
 '''
 
 
@@ -124,6 +105,11 @@ def parse_args() -> argparse.Namespace:
         help="Explicit list of JSONL files to evaluate (overrides --pattern/beta range).",
     )
     parser.add_argument(
+        "--dir",
+        type=Path,
+        help="Directory to scan recursively for JSONL files (used when --files is not provided).",
+    )
+    parser.add_argument(
         "--labels",
         nargs="*",
         help="Optional labels aligned with --files. If omitted, labels are derived.",
@@ -210,11 +196,16 @@ def main() -> int:
         print(f"Missing benchmark file: {args.benchmark}", file=sys.stderr)
 
     results = []
-    if args.files:
-        files = [Path(p) for p in args.files]
+    if args.files or args.dir:
+        if args.files:
+            files = [Path(p) for p in args.files]
+        else:
+            files = sorted(args.dir.rglob("*.jsonl"))
+            if not files and not args.quiet:
+                print(f"No JSONL files found under: {args.dir}", file=sys.stderr)
         labels = list(args.labels) if args.labels else [derive_label(p) for p in files]
         if len(labels) != len(files):
-            raise ValueError("Length of --labels must match --files when provided.")
+            raise ValueError("Length of --labels must match --files/--dir results when provided.")
         for path, label in zip(files, labels):
             if not path.exists():
                 if not args.quiet:
