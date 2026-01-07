@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 '''
-python compute_memtree_metrics.py --dir results/v4_leaf_retrieval_vit_l_p14_text_embedding
+python utils/compute_memtree_metrics.py --dir results/v3_leaf_retrieval_vit_b_p32_text_embedding
 '''
 
 

@@ -33,6 +33,7 @@
   VLM_MODEL=../ckpts/Qwen2.5-VL-7B-Instruct \
   LEAF_TEXT_MODEL=../ckpts/Qwen3-Embedding-0.6B \
   LEAF_TEXT_DEVICE=cuda:2 \
+  TWO_STAGE=0 \
   RETRIEVAL_MODE=collapsed \
   BATCH_SIZE=2 \
   PREFETCH_BATCHES=2 \
@@ -52,13 +53,14 @@ IMAGES_ROOT=${IMAGES_ROOT:-../benchmark/oven}
 IMAGE_INDEX_CSV=${IMAGE_INDEX_CSV:-infoseek_image_index.csv}
 COLLECTION=${COLLECTION:-memtree}
 CLIP_MODEL=${CLIP_MODEL:-../ckpts/clip-vit-base-patch32}
-LEAF_TEXT_MODEL=${LEAF_TEXT_MODEL:-../ckpts/Qwen3-Embedding-0.6B}
+LEAF_TEXT_MODEL=${LEAF_TEXT_MODEL-../ckpts/Qwen3-Embedding-0.6B}
 LEAF_TEXT_DEVICE=${LEAF_TEXT_DEVICE:-}
 VLM_MODEL=${VLM_MODEL:-../ckpts/Qwen2.5-VL-7B-Instruct}
 ANSWER_MODE=${ANSWER_MODE:-vlm}
 TEXT_MODEL=${TEXT_MODEL:-../ckpts/Qwen3-Embedding-0.6B}
 TRUST_REMOTE_CODE=${TRUST_REMOTE_CODE:-0}
 BATCH_SIZE=${BATCH_SIZE:-1}
+TWO_STAGE=${TWO_STAGE:-1}
 PREFETCH_BATCHES=${PREFETCH_BATCHES:-1}
 RETRIEVAL_WORKERS=${RETRIEVAL_WORKERS:-4}
 ROOT_TOP_K=${ROOT_TOP_K:-3}
@@ -116,6 +118,7 @@ for idx in "${!SHARDS[@]}"; do
     --answer-mode "${ANSWER_MODE}"
     --root-top-k "${ROOT_TOP_K}"
     --event-top-k "${EVENT_TOP_K}"
+    --two-stage "${TWO_STAGE}"
     --leaf-top-k "${LEAF_TOP_K}"
     --alpha "${ALPHA}"
     --max-trees "${MAX_TREES}"

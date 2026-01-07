@@ -1304,6 +1304,7 @@ class MemoryForestStore(QdrantStore):
         query_text: Optional[str] = None,
         query_image: Optional[Union[str, bytes, Any]] = None,
         leaf_text_embedder: Optional[Any] = None,
+        two_stage: bool = True,
         alpha: Optional[float] = None,
         fusion_fn: Optional[
             Callable[[np.ndarray, Optional[np.ndarray]], np.ndarray]
@@ -1317,6 +1318,7 @@ class MemoryForestStore(QdrantStore):
         1) Global leaf search to find candidate trees.
         2) Per-tree leaf search within candidates to gather top-k leaves and events.
            If ``leaf_text_embedder`` is provided, stage 2 uses text-only leaf vectors.
+        When ``two_stage`` is False, only stage 1 is used and ``leaf_text_embedder`` is ignored.
         """
         text_vec = (
             embedder.embed_texts([query_text])[0]
@@ -1337,20 +1339,21 @@ class MemoryForestStore(QdrantStore):
 
         root_query = self._build_query_vector(text_vec, image_vec, alpha, fusion_fn)
 
-        if leaf_text_embedder is not None and not self.leaf_has_named_vectors:
-            raise ValueError(
-                "leaf_text_vector_size must be set on MemoryForestStore to query text-only leaf vectors."
-            )
-        if leaf_text_embedder is not None and self.leaf_text_vector_size is not None:
-            embedder_dim = getattr(leaf_text_embedder, "dim", None)
-            if embedder_dim is not None and int(embedder_dim) != int(self.leaf_text_vector_size):
-                raise ValueError(
-                    f"Leaf text embedder dim {embedder_dim} does not match "
-                    f"leaf_text_vector_size={self.leaf_text_vector_size}."
-                )
         text_query_vec = None
-        if leaf_text_embedder is not None and query_text is not None:
-            text_query_vec = leaf_text_embedder.embed_texts([query_text])[0]
+        if two_stage:
+            if leaf_text_embedder is not None and not self.leaf_has_named_vectors:
+                raise ValueError(
+                    "leaf_text_vector_size must be set on MemoryForestStore to query text-only leaf vectors."
+                )
+            if leaf_text_embedder is not None and self.leaf_text_vector_size is not None:
+                embedder_dim = getattr(leaf_text_embedder, "dim", None)
+                if embedder_dim is not None and int(embedder_dim) != int(self.leaf_text_vector_size):
+                    raise ValueError(
+                        f"Leaf text embedder dim {embedder_dim} does not match "
+                        f"leaf_text_vector_size={self.leaf_text_vector_size}."
+                    )
+            if leaf_text_embedder is not None and query_text is not None:
+                text_query_vec = leaf_text_embedder.embed_texts([query_text])[0]
 
         # Stage 1: global leaf search to locate candidate trees.
         stage1_points = self._search_collection(
@@ -1380,48 +1383,64 @@ class MemoryForestStore(QdrantStore):
 
         tree_order.sort(key=lambda tree_id: tree_scores.get(tree_id, 0.0), reverse=True)
 
-        # Stage 2: search leaves within each candidate tree.
         tree_to_event_leaves: Dict[str, Dict[str, List[RetrievalHit]]] = defaultdict(dict)
         event_scores: Dict[str, float] = {}
         event_ids: List[str] = []
 
-        stage2_query_vec = text_query_vec if text_query_vec is not None else root_query
-        stage2_vector_name = (
-            self.leaf_text_vector_name
-            if text_query_vec is not None
-            else (self.leaf_vector_name if self.leaf_has_named_vectors else None)
-        )
-        for tree_id in tree_order:
-            base_filter = qmodels.Filter(
-                must=[
-                    qmodels.FieldCondition(
-                        key="tree_id",
-                        match=qmodels.MatchValue(value=tree_id),
-                    )
-                ]
-            )
-            merged_filter = self._merge_filters(base_filter, leaf_filter)
-            leaf_points = self._search_collection(
-                collection_name=self.leaf_collection,
-                query_vec=stage2_query_vec,
-                top_k=leaf_top_k,
-                filter_=merged_filter,
-                score_threshold=leaf_score_threshold,
-                vector_name=stage2_vector_name,
-            )
-            leaf_hits = [self._to_hit(point, NodeRole.LEAF, self.leaf_collection) for point in leaf_points]
-            if not leaf_hits:
-                continue
-            event_map = tree_to_event_leaves.setdefault(tree_id, {})
-            for hit in leaf_hits:
+        if not two_stage:
+            for hit in stage1_hits:
+                tree_id = hit.payload.get("tree_id")
+                if not tree_id:
+                    continue
+                tree_id = str(tree_id)
                 raw_event_id = hit.payload.get("parent_id")
                 if not raw_event_id:
                     continue
                 event_id = str(self._normalize_id(raw_event_id))
+                event_map = tree_to_event_leaves.setdefault(tree_id, {})
                 event_map.setdefault(event_id, []).append(hit)
                 event_scores[event_id] = max(event_scores.get(event_id, 0.0), float(hit.score))
                 if event_id not in event_ids:
                     event_ids.append(event_id)
+        else:
+            # Stage 2: search leaves within each candidate tree.
+            stage2_query_vec = text_query_vec if text_query_vec is not None else root_query
+            stage2_vector_name = (
+                self.leaf_text_vector_name
+                if text_query_vec is not None
+                else (self.leaf_vector_name if self.leaf_has_named_vectors else None)
+            )
+            for tree_id in tree_order:
+                base_filter = qmodels.Filter(
+                    must=[
+                        qmodels.FieldCondition(
+                            key="tree_id",
+                            match=qmodels.MatchValue(value=tree_id),
+                        )
+                    ]
+                )
+                merged_filter = self._merge_filters(base_filter, leaf_filter)
+                leaf_points = self._search_collection(
+                    collection_name=self.leaf_collection,
+                    query_vec=stage2_query_vec,
+                    top_k=leaf_top_k,
+                    filter_=merged_filter,
+                    score_threshold=leaf_score_threshold,
+                    vector_name=stage2_vector_name,
+                )
+                leaf_hits = [self._to_hit(point, NodeRole.LEAF, self.leaf_collection) for point in leaf_points]
+                if not leaf_hits:
+                    continue
+                event_map = tree_to_event_leaves.setdefault(tree_id, {})
+                for hit in leaf_hits:
+                    raw_event_id = hit.payload.get("parent_id")
+                    if not raw_event_id:
+                        continue
+                    event_id = str(self._normalize_id(raw_event_id))
+                    event_map.setdefault(event_id, []).append(hit)
+                    event_scores[event_id] = max(event_scores.get(event_id, 0.0), float(hit.score))
+                    if event_id not in event_ids:
+                        event_ids.append(event_id)
 
         event_payloads: Dict[str, Any] = {}
         if event_ids:

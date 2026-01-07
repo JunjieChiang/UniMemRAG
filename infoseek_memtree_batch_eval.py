@@ -441,6 +441,7 @@ def run_infoseek_evaluation(
     prefetch_batches: int = 4,
     tqdm_position: int = 0,
     retrieval_mode: str = "collapsed",
+    two_stage: bool = True,
     include_images_in_messages: bool = True,
 ) -> Dict[str, Any]:
     if batch_size <= 0:
@@ -559,6 +560,7 @@ def run_infoseek_evaluation(
                 query_text=question,
                 query_image=image_path.as_posix(),
                 leaf_text_embedder=leaf_text_embedder,
+                two_stage=two_stage,
                 leaf_top_k=leaf_top_k,
                 alpha=alpha,
             )
@@ -703,6 +705,13 @@ def main() -> None:
         default="collapsed",
         help="Select retrieval strategy: collapsed (leaf-only) or hierarchical (root->event->leaf).",
     )
+    parser.add_argument(
+        "--two-stage",
+        type=int,
+        choices=[0, 1],
+        default=1,
+        help="When retrieval-mode=collapsed, set 0 to disable stage-2 per-tree search (leaf_text_embedder ignored).",
+    )
     parser.add_argument("--ingest-kb", action="store_true")
     parser.add_argument("--kb-path", default="../benchmark/infoseek/subset/wiki_text/wiki_5k_dict.json")
     parser.add_argument("--image-cache-dir", default="../benchmark/infoseek/subset/wiki_text/images_5k")
@@ -724,15 +733,15 @@ def main() -> None:
     dataset = load_infoseek_dataset(args.dataset)
 
     cfg = Config(collection=args.collection)
-    # embedder = ClipEmbedding(model_name=args.clip_model, device_map="balanced", image_processor_name_or_path="../ckpts/clip-vit-large-patch14")
-    embedder = ClipEmbedding(model_name=args.clip_model, image_processor_name_or_path="../ckpts/clip-vit-large-patch14", device="cuda:auto")
+    embedder = ClipEmbedding(model_name=args.clip_model, device_map="balanced", image_processor_name_or_path="../ckpts/clip-vit-large-patch14")
+    # embedder = ClipEmbedding(model_name=args.clip_model, image_processor_name_or_path="../ckpts/clip-vit-large-patch14", device="cuda:auto")
     leaf_text_embedder: Optional[QwenTextEmbedding] = None
     leaf_text_vector_size: Optional[int] = None
     if args.leaf_text_model:
         leaf_text_embedder = QwenTextEmbedding(
             model_name=args.leaf_text_model,
-            device=args.leaf_text_device,
-            # model_kwargs={'device_map': "balanced"}
+            # device=args.leaf_text_device,
+            model_kwargs={'device_map': "balanced"}
         )
         leaf_text_vector_size = leaf_text_embedder.dim
     memforest_store = MemoryForestStore(
@@ -806,6 +815,7 @@ def main() -> None:
         prefetch_batches=args.prefetch_batches,
         tqdm_position=args.tqdm_position,
         retrieval_mode=args.retrieval_mode,
+        two_stage=bool(args.two_stage),
         include_images_in_messages=include_images_in_messages,
     )
 
