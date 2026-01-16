@@ -1681,27 +1681,42 @@ def summarize_event(paragraph: str) -> str:
     return (sentence if sentence else stripped)
 
 
-def summarize_event_with_llm(
+def _is_openai_chat_client(llm: Any) -> bool:
+    chat = getattr(llm, "chat", None)
+    completions = getattr(chat, "completions", None)
+    return bool(getattr(completions, "create", None))
+
+
+def _resolve_max_new_tokens(request_kwargs: Optional[Dict[str, Any]], default: int = 512) -> int:
+    if not request_kwargs:
+        return default
+    if "max_new_tokens" in request_kwargs:
+        return int(request_kwargs["max_new_tokens"])
+    if "max_tokens" in request_kwargs:
+        return int(request_kwargs["max_tokens"])
+    return default
+
+
+def _extract_generate_kwargs(request_kwargs: Optional[Dict[str, Any]]) -> Dict[str, Any]:
+    if not request_kwargs:
+        return {}
+    generate_kwargs = dict(request_kwargs)
+    generate_kwargs.pop("max_tokens", None)
+    generate_kwargs.pop("max_new_tokens", None)
+    generate_kwargs.pop("extra_body", None)
+    return generate_kwargs
+
+
+def _build_summary_messages(
     leaf_texts: Sequence[str],
     *,
-    llm: Any,
-    model: str,
     section_title: str = "",
     max_leaf_texts: Optional[int] = None,
     max_chars_per_leaf: int = 1200,
-    request_kwargs: Optional[Dict[str, Any]] = None,
-) -> str:
-    """
-    Generate an event summary using an OpenAI-compatible client (e.g., DashScope compatible-mode).
-
-    Notes:
-        - The input MUST be the leaf node texts for that section (per design).
-        - ``llm`` is expected to be an ``openai.OpenAI(...)`` client with
-          ``llm.chat.completions.create(model=..., messages=[...], ...)``.
-    """
+) -> List[Dict[str, str]]:
     texts = [t.strip() for t in (leaf_texts or []) if isinstance(t, str) and t.strip()]
     if not texts:
-        return ""
+        return []
 
     if max_leaf_texts is not None and max_leaf_texts > 0:
         texts = texts[:max_leaf_texts]
@@ -1722,29 +1737,144 @@ def summarize_event_with_llm(
         f"{joined}\n"
     )
 
-    messages = [
+    return [
         {"role": "system", "content": "You are a helpful summarizer."},
         {"role": "user", "content": prompt},
     ]
-    kwargs: Dict[str, Any] = {
-        "max_tokens": 512,
-        "temperature": 0.7,
-        "top_p": 0.9,
-    }
-    if request_kwargs:
-        kwargs.update(request_kwargs)
 
-    resp = llm.chat.completions.create(
-        model=model,
-        messages=messages,
-        **kwargs,
+
+def summarize_event_with_llm(
+    leaf_texts: Sequence[str],
+    *,
+    llm: Any,
+    model: str,
+    section_title: str = "",
+    max_leaf_texts: Optional[int] = None,
+    max_chars_per_leaf: int = 1200,
+    request_kwargs: Optional[Dict[str, Any]] = None,
+) -> str:
+    """
+    Generate an event summary using an OpenAI-compatible client or a local chat model.
+
+    Notes:
+        - The input MUST be the leaf node texts for that section (per design).
+        - ``llm`` can be an ``openai.OpenAI(...)`` client with
+          ``llm.chat.completions.create(model=..., messages=[...], ...)``, or a
+          local model wrapper implementing ``chat(messages, max_new_tokens=...)``.
+    """
+    messages = _build_summary_messages(
+        leaf_texts,
+        section_title=section_title,
+        max_leaf_texts=max_leaf_texts,
+        max_chars_per_leaf=max_chars_per_leaf,
     )
-    content = ""
-    try:
-        content = resp.choices[0].message.content or ""
-    except Exception:
-        content = str(resp)
-    return str(content).strip()
+    if not messages:
+        return ""
+
+    if _is_openai_chat_client(llm):
+        kwargs: Dict[str, Any] = {
+            "max_tokens": 512,
+            "temperature": 0.7,
+            "top_p": 0.9,
+        }
+        if request_kwargs:
+            kwargs.update(request_kwargs)
+
+        resp = llm.chat.completions.create(
+            model=model,
+            messages=messages,
+            **kwargs,
+        )
+        content = ""
+        try:
+            content = resp.choices[0].message.content or ""
+        except Exception:
+            content = str(resp)
+        return str(content).strip()
+
+    if hasattr(llm, "chat"):
+        max_new_tokens = _resolve_max_new_tokens(request_kwargs, default=512)
+        generate_kwargs = _extract_generate_kwargs(request_kwargs)
+        response = llm.chat(messages, max_new_tokens=max_new_tokens, **generate_kwargs)
+        return str(response).strip()
+
+    raise TypeError("Unsupported llm client; expected OpenAI-compatible or local chat interface.")
+
+
+def summarize_events_with_llm_batch(
+    event_specs: Sequence[Dict[str, Any]],
+    *,
+    llm: Any,
+    model: str,
+    max_leaf_texts: Optional[int] = None,
+    max_chars_per_leaf: int = 1200,
+    request_kwargs: Optional[Dict[str, Any]] = None,
+    batch_size: int = 8,
+    show_progress: bool = True,
+    progress_desc: Optional[str] = None,
+) -> Dict[int, str]:
+    """
+    Generate summaries in batches using ``llm.chat_batch``.
+
+    This is intended for local models that can batch multiple prompts per forward pass.
+    """
+    _ = model
+    if not hasattr(llm, "chat_batch"):
+        raise TypeError("llm does not support chat_batch")
+    if batch_size <= 0:
+        batch_size = 1
+
+    messages_list: List[List[Dict[str, str]]] = []
+    sec_indices: List[int] = []
+    for spec in event_specs:
+        leaf_texts = spec.get("leaf_texts") or []
+        if not leaf_texts:
+            continue
+        sec_idx = int(spec.get("sec_idx", 0))
+        messages = _build_summary_messages(
+            leaf_texts,
+            section_title=str(spec.get("section_title") or ""),
+            max_leaf_texts=max_leaf_texts,
+            max_chars_per_leaf=max_chars_per_leaf,
+        )
+        if not messages:
+            continue
+        messages_list.append(messages)
+        sec_indices.append(sec_idx)
+
+    if not messages_list:
+        return {}
+
+    total_batches = (len(messages_list) + batch_size - 1) // batch_size
+    progress = None
+    if show_progress and tqdm is not None:
+        progress = tqdm(total=total_batches, desc=progress_desc or "Summaries", leave=False)
+
+    summaries: Dict[int, str] = {}
+    max_new_tokens = _resolve_max_new_tokens(request_kwargs, default=512)
+    generate_kwargs = _extract_generate_kwargs(request_kwargs)
+
+    for start in range(0, len(messages_list), batch_size):
+        batch_messages = messages_list[start : start + batch_size]
+        batch_indices = sec_indices[start : start + batch_size]
+        outputs = llm.chat_batch(batch_messages, max_new_tokens=max_new_tokens, **generate_kwargs)
+        if len(outputs) != len(batch_messages):
+            logger.warning(
+                "LLM batch returned %s outputs for %s prompts; truncating.",
+                len(outputs),
+                len(batch_messages),
+            )
+        for sec_idx, output in zip(batch_indices, outputs):
+            output_text = str(output).strip() if output is not None else ""
+            if output_text:
+                summaries[sec_idx] = output_text
+        if progress is not None:
+            progress.update(1)
+
+    if progress is not None:
+        progress.close()
+
+    return summaries
 
 
 def build_image_index(
@@ -1766,6 +1896,41 @@ def build_image_index(
     return mapping
 
 
+def _coerce_list(value: Any) -> List[Any]:
+    if value is None:
+        return []
+    if isinstance(value, list):
+        return list(value)
+    if isinstance(value, tuple):
+        return list(value)
+    return [value]
+
+
+def _normalize_section_text(value: Any) -> str:
+    if value is None:
+        return ""
+    if isinstance(value, str):
+        return value
+    if isinstance(value, (list, tuple)):
+        return " ".join(str(item) for item in value if item)
+    return str(value)
+
+
+def _normalize_image_values(values: Sequence[Any]) -> List[Optional[str]]:
+    normalized: List[Optional[str]] = []
+    for item in values:
+        if item is None:
+            normalized.append(None)
+            continue
+        if isinstance(item, Path):
+            text = item.as_posix()
+        else:
+            text = str(item)
+        text = text.strip()
+        normalized.append(text or None)
+    return normalized
+
+
 def build_tree(
     wiki_url: str,
     payload: Dict[str, Any],
@@ -1777,6 +1942,7 @@ def build_tree(
     llm_model: str = "qwen-plus",
     llm_request_kwargs: Optional[Dict[str, Any]] = None,
     llm_workers: int = 1,
+    llm_batch_size: Optional[int] = None,
     show_progress: bool = True,
 ) -> MemoryTree:
     """
@@ -1785,30 +1951,109 @@ def build_tree(
     If ``llm`` is provided (e.g., ``openai.OpenAI(...)`` client for DashScope compatible-mode),
     each event summary is generated via ``llm.chat.completions.create(...)`` using the corresponding leaf texts as input. The
     ``max_summary_sections`` value caps how many leaf texts are included in that prompt
-    (use ``None`` for unlimited).
+    (use ``None`` for unlimited). If ``llm`` is None, summaries are left empty.
 
-    Set ``llm_workers>1`` to summarize sections concurrently.
+    Set ``llm_workers>1`` to summarize sections concurrently (thread pool).
+
+    For local models that implement ``chat_batch``, set ``llm_batch_size`` to
+    batch multiple summaries per forward pass.
 
     Set ``show_progress=True`` to see a tqdm progress bar over sections (if tqdm is installed).
     """
     logger.info("Building tree for %s", wiki_url)
-    topic = (payload.get("title") or "").strip()
-    section_titles = list(payload.get("section_titles") or [])
-    section_texts = list(payload.get("section_texts") or [])
-    image_urls = list(payload.get("image_urls") or [])
-    image_section_indices = list(payload.get("image_section_indices") or [])
+    source_url = str(
+        payload.get("url")
+        or payload.get("wikipedia_url")
+        or payload.get("source_url")
+        or wiki_url
+    )
+    topic = str(
+        payload.get("title")
+        or payload.get("wikipedia_title")
+        or payload.get("page_title")
+        or payload.get("entity")
+        or ""
+    ).strip()
+
+    section_titles = _coerce_list(payload.get("section_titles"))
+    section_texts = _coerce_list(payload.get("section_texts"))
+    if not section_titles and not section_texts:
+        sections_payload = payload.get("sections")
+        if isinstance(sections_payload, list) and all(isinstance(item, dict) for item in sections_payload):
+            for item in sections_payload:
+                section_titles.append(_normalize_section_text(item.get("title")))
+                section_texts.append(
+                    _normalize_section_text(item.get("text") or item.get("content"))
+                )
+
+    if not section_titles and not section_texts:
+        summary_hint = _normalize_section_text(
+            payload.get("summary") or payload.get("wikipedia_summary")
+        )
+        context = _normalize_section_text(
+            payload.get("context")
+            or payload.get("wikipedia_content")
+            or payload.get("content")
+            or payload.get("text")
+            or summary_hint
+        )
+        if context or summary_hint or topic:
+            section_titles = [topic or ""]
+            section_texts = [context]
+
     section_count = max(len(section_titles), len(section_texts))
     section_titles_clean = [
-        (section_titles[idx] if idx < len(section_titles) else "").strip()
+        _normalize_section_text(section_titles[idx]).strip()
+        if idx < len(section_titles)
+        else ""
         for idx in range(section_count)
     ]
     section_texts_clean = [
-        (section_texts[idx] if idx < len(section_texts) else "").strip()
+        _normalize_section_text(section_texts[idx]).strip()
+        if idx < len(section_texts)
+        else ""
         for idx in range(section_count)
     ]
+    image_urls_raw = (
+        payload.get("image_urls")
+        or payload.get("image_url")
+        or payload.get("wikipedia_image_url")
+        or payload.get("image")
+        or []
+    )
+    image_urls = _normalize_image_values(_coerce_list(image_urls_raw))
+    local_image_paths = _normalize_image_values(
+        _coerce_list(payload.get("local_image_paths") or payload.get("local_image_path"))
+    )
+    if not image_urls and local_image_paths:
+        image_urls = list(local_image_paths)
+    if local_image_paths:
+        for idx, local_path in enumerate(local_image_paths):
+            if local_path and idx < len(image_urls):
+                image_urls[idx] = local_path
+
+    image_section_indices_raw = _coerce_list(payload.get("image_section_indices"))
+    image_section_indices: List[Optional[int]] = [
+        item if isinstance(item, int) else None for item in image_section_indices_raw
+    ]
+
+    filtered_urls: List[str] = []
+    filtered_indices: List[Optional[int]] = []
+    for idx, url in enumerate(image_urls):
+        if not url:
+            continue
+        filtered_urls.append(url)
+        if idx < len(image_section_indices):
+            filtered_indices.append(image_section_indices[idx])
+        else:
+            filtered_indices.append(None)
+    image_urls = filtered_urls
+    image_section_indices = filtered_indices
+    if not image_section_indices and image_urls and section_count == 1:
+        image_section_indices = [0 for _ in image_urls]
 
     root_metadata: Dict[str, Any] = {
-        "source_url": payload.get("url", wiki_url),
+        "source_url": source_url,
         "num_sections": section_count,
         "num_images": len(image_urls),
     }
@@ -1847,7 +2092,13 @@ def build_tree(
             position=progress_position,
         )
 
-    use_llm_concurrency = llm is not None and llm_workers > 1
+    use_llm_batch = (
+        llm is not None
+        and llm_batch_size is not None
+        and int(llm_batch_size) > 0
+        and hasattr(llm, "chat_batch")
+    )
+    use_llm_concurrency = llm is not None and llm_workers > 1 and not use_llm_batch
 
     for sec_idx in section_iter:
         title_clean = section_titles_clean[sec_idx] if sec_idx < len(section_titles_clean) else ""
@@ -1859,7 +2110,7 @@ def build_tree(
         event_metadata: Dict[str, Any] = {
             "section_index": sec_idx,
             "section_title": title_clean,
-            "source_url": payload.get("url", wiki_url),
+            "source_url": source_url,
         }
         if text_clean:
             event_metadata["section_preview"] = text_clean[:512]
@@ -1896,8 +2147,8 @@ def build_tree(
                     )
                 )
 
-        summary = "" if use_llm_concurrency else summarize_event(text_clean)
-        if llm is not None and section_leaf_texts and llm_workers <= 1:
+        summary = ""
+        if llm is not None and section_leaf_texts and llm_workers <= 1 and not use_llm_batch:
             try:
                 llm_summary = summarize_event_with_llm(
                     section_leaf_texts,
@@ -1910,7 +2161,7 @@ def build_tree(
                 if llm_summary:
                     summary = llm_summary
             except Exception:
-                logger.exception("LLM summarization failed for %s sec=%s; falling back.", wiki_url, sec_idx)
+                logger.exception("LLM summarization failed for %s sec=%s; leaving empty.", wiki_url, sec_idx)
 
         event_specs.append(
             {
@@ -1919,14 +2170,30 @@ def build_tree(
                 "event_metadata": event_metadata,
                 "leaf_ids": tuple(section_leaf_ids),
                 "leaf_texts": section_leaf_texts,
-                "fallback_summary": "" if use_llm_concurrency else summary,
+                "fallback_summary": summary,
                 "fallback_text": text_clean,
                 "section_title": title_clean,
             }
         )
 
     summaries: Dict[int, str] = {int(spec["sec_idx"]): str(spec["fallback_summary"] or "") for spec in event_specs}
-    if llm is not None and llm_workers > 1:
+    if llm is not None and use_llm_batch:
+        try:
+            batch_summaries = summarize_events_with_llm_batch(
+                event_specs,
+                llm=llm,
+                model=llm_model,
+                max_leaf_texts=max_summary_sections,
+                request_kwargs=llm_request_kwargs,
+                batch_size=int(llm_batch_size or 1),
+                show_progress=show_progress,
+                progress_desc=f"Summaries[{wiki_url}]",
+            )
+            summaries.update(batch_summaries)
+        except Exception:
+            logger.exception("LLM batch summarization failed for %s; leaving empty.", wiki_url)
+
+    if llm is not None and llm_workers > 1 and not use_llm_batch:
         summary_progress = None
         if show_progress and tqdm is not None:
             total_summaries = sum(1 for spec in event_specs if spec.get("leaf_texts"))
@@ -1971,20 +2238,12 @@ def build_tree(
                         if llm_summary:
                             summaries[sec_idx] = llm_summary
                     except Exception:
-                        logger.exception("LLM summarization failed for %s sec=%s; falling back.", wiki_url, sec_idx)
+                        logger.exception("LLM summarization failed for %s sec=%s; leaving empty.", wiki_url, sec_idx)
                     if summary_progress is not None:
                         summary_progress.update(1)
         finally:
             if summary_progress is not None:
                 summary_progress.close()
-
-        for spec in event_specs:
-            sec_idx = int(spec["sec_idx"])
-            if summaries.get(sec_idx):
-                continue
-            fallback_text = str(spec.get("fallback_text") or "")
-            if fallback_text:
-                summaries[sec_idx] = summarize_event(fallback_text)
 
     events: List[EventNode] = [
         EventNode(

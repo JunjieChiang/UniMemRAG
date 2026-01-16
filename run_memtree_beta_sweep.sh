@@ -34,7 +34,8 @@ TWO_STAGE="${TWO_STAGE:-1}"
 ANSWER_MODE="${ANSWER_MODE:-vlm}"
 TEXT_MODEL="${TEXT_MODEL:-../ckpts/Qwen2.5-VL-7B-Instruct}"
 TRUST_REMOTE_CODE="${TRUST_REMOTE_CODE:-1}"
-DATASET="${DATASET:-../benchmark/infoseek/subset/infoseek_val_5k.jsonl}"
+# DATASET="${DATASET:-../benchmark/infoseek/subset/infoseek_val_5k.jsonl}"
+DATASET="${DATASET:-benchmark/infoseek_val.jsonl}"
 IMAGES_ROOT="${IMAGES_ROOT:-../benchmark/oven}"
 IMAGE_INDEX_CSV="${IMAGE_INDEX_CSV:-infoseek_image_index.csv}"
 VLM_MODEL="${VLM_MODEL:-../ckpts/Qwen2.5-VL-7B-Instruct}"
@@ -210,7 +211,7 @@ for beta in "${BETAS_LIST[@]}"; do
     run_id="beta_${beta}_top${leaf_top_k}"
     shard_dir="${SHARD_DIR_BASE}/${run_id}"
     output_dir="${OUTPUT_DIR_BASE}/${run_id}"
-    merged_path="infoseek_memtree_predictions_all_5k_collapsed_beta_${beta}_update_top${leaf_top_k}.jsonl"
+    merged_path="infoseek_memtree_predictions_all_collapsed_beta_${beta}_update_top${leaf_top_k}.jsonl"
 
     rm -f "${shard_dir}"/part_* 2>/dev/null || true
     rm -f "${output_dir}"/pred_*.jsonl "${output_dir}"/log_*.txt 2>/dev/null || true

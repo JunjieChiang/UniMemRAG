@@ -26,6 +26,19 @@ Example usage (multi-modal KB with image downloads):
         --output benchmark/infoseek/wiki_text/infoseek_kb_100k_mm.jsonl \\
         --image-dir benchmark/infoseek/images_100k \\
         --download-images --max-workers 16
+
+Example usage (E-VQA image downloads):
+    python examples/prepare_infoseek_kb.py \
+        --evqa-kb /home/mobuser/jjj/benchmark/encyclopedic_vqa/encyclopedic_kb_wiki.json \
+        --image-dir benchmark/encyclopedic_vqa/images_kb \
+        --download-images --max-workers 16
+
+Optional (write E-VQA KB with local image paths):
+    python examples/prepare_infoseek_kb.py \\
+        --evqa-kb /home/mobuser/jjj/benchmark/encyclopedic_vqa/encyclopedic_kb_wiki.json \\
+        --image-dir benchmark/encyclopedic_vqa/images \\
+        --download-images \\
+        --evqa-output benchmark/encyclopedic_vqa/encyclopedic_kb_wiki_local.json
 """
 
 from __future__ import annotations
@@ -34,11 +47,14 @@ os.environ.pop("http_proxy", None)
 os.environ.pop("https_proxy", None)
 os.environ["NO_PROXY"] = "localhost,127.0.0.1"
 
+import shutil
+import subprocess
 import argparse
+import hashlib
 import json
 import random
 import time
-from concurrent.futures import ThreadPoolExecutor, as_completed
+from concurrent.futures import FIRST_COMPLETED, ThreadPoolExecutor, as_completed, wait
 from pathlib import Path
 from typing import Dict, Iterable, Iterator, List, Optional, Sequence, Set, Tuple
 from urllib.error import HTTPError, URLError
@@ -81,6 +97,106 @@ def read_jsonl(path: Path) -> Iterator[Dict]:
                 raise ValueError(f"Invalid JSON at {path}:{line_no}") from exc
 
 
+def iter_json_object_items(path: Path, *, chunk_size: int = 1024 * 1024) -> Iterator[Tuple[str, object]]:
+    """Stream key/value pairs from a large JSON object without loading it fully."""
+
+    decoder = json.JSONDecoder()
+    with path.open("r", encoding="utf-8") as handle:
+        buf = ""
+        pos = 0
+        eof = False
+
+        def fill() -> None:
+            nonlocal buf, eof
+            if eof:
+                return
+            chunk = handle.read(chunk_size)
+            if chunk:
+                buf += chunk
+            else:
+                eof = True
+
+        fill()
+        while True:
+            while pos < len(buf) and buf[pos].isspace():
+                pos += 1
+            if pos < len(buf):
+                if buf[pos] != "{":
+                    raise ValueError(f"Expected JSON object in {path}")
+                pos += 1
+                break
+            if eof:
+                raise ValueError(f"Empty JSON file: {path}")
+            fill()
+
+        while True:
+            while True:
+                while pos < len(buf) and (buf[pos].isspace() or buf[pos] == ","):
+                    pos += 1
+                if pos < len(buf):
+                    break
+                if eof:
+                    raise ValueError(f"Unexpected end of JSON object: {path}")
+                fill()
+
+            if buf[pos] == "}":
+                break
+
+            while True:
+                try:
+                    key, end = decoder.raw_decode(buf, pos)
+                except json.JSONDecodeError:
+                    if eof:
+                        raise
+                    fill()
+                    continue
+                if not isinstance(key, str):
+                    raise ValueError(f"Expected string key in {path}")
+                pos = end
+                break
+
+            while True:
+                while pos < len(buf) and buf[pos].isspace():
+                    pos += 1
+                if pos < len(buf):
+                    break
+                if eof:
+                    raise ValueError(f"Unexpected end after key in {path}")
+                fill()
+
+            if buf[pos] != ":":
+                raise ValueError(f"Expected ':' after key in {path}")
+            pos += 1
+
+            while True:
+                while pos < len(buf) and buf[pos].isspace():
+                    pos += 1
+                if pos < len(buf):
+                    break
+                if eof:
+                    raise ValueError(f"Unexpected end after ':' in {path}")
+                fill()
+
+            while True:
+                try:
+                    value, end = decoder.raw_decode(buf, pos)
+                except json.JSONDecodeError:
+                    if eof:
+                        raise
+                    fill()
+                    continue
+                pos = end
+                break
+
+            yield key, value
+
+            if pos > chunk_size:
+                buf = buf[pos:]
+                pos = 0
+                if not eof and len(buf) < chunk_size:
+                    fill()
+
+
 def load_required_entities(mapping_path: Path) -> Dict[str, List[str]]:
     """Return a mapping from entity id to the validation data ids that require it."""
 
@@ -110,6 +226,13 @@ def _pick_image_extension(url: str) -> str:
         if potential in allowed:
             return potential
     return ".jpg"
+
+
+def _filename_from_url(url: str) -> str:
+    """Generate a stable filename for a URL using a hash and inferred extension."""
+
+    digest = hashlib.sha1(url.encode("utf-8")).hexdigest()
+    return f"{digest}{_pick_image_extension(url)}"
 
 
 def _relative_to(path: Path, root: Path) -> str:
@@ -231,48 +354,193 @@ def _download_single_image(
     user_agent: str,
     retries: int,
     retry_delay: float,
-    chunk_size: int,
+    chunk_size: int,  # kept for API compatibility; unused by wget
 ) -> Tuple[bool, Optional[str]]:
-    """Download a single image returning (success, error_message)."""
+    """Download a single image using wget, returning (success, error_message)."""
+
+    wget_path = shutil.which("wget")
+    if not wget_path:
+        return False, "wget not found in PATH. Please install wget or use requests/urlopen mode."
+
+    destination.parent.mkdir(parents=True, exist_ok=True)
 
     attempts = retries + 1
     for attempt in range(1, attempts + 1):
+        tmp_path = destination.with_suffix(destination.suffix + ".part")
+
+        # wget options:
+        # -q: quiet (you can remove to debug)
+        # --timeout: network timeout per operation (seconds)
+        # --tries=1: we handle retries ourselves
+        # -U: User-Agent
+        # -O: output file
+        cmd = [
+            wget_path,
+            "-q",
+            "--timeout",
+            str(timeout),
+            "--tries",
+            "1",
+            "-U",
+            user_agent,
+            "-O",
+            str(tmp_path),
+            url,
+        ]
+
         try:
-            if requests is not None:
-                with requests.get(
-                    url,
-                    headers={"User-Agent": user_agent},
-                    timeout=timeout,
-                    stream=True,
-                ) as response:
-                    response.raise_for_status()
-                    destination.parent.mkdir(parents=True, exist_ok=True)
-                    with destination.open("wb") as handle:
-                        for chunk in response.iter_content(chunk_size=chunk_size):
-                            if chunk:
-                                handle.write(chunk)
-            else:
-                request = Request(url, headers={"User-Agent": user_agent})
-                with urlopen(request, timeout=timeout) as response:
-                    data = response.read()
-                destination.parent.mkdir(parents=True, exist_ok=True)
-                with destination.open("wb") as handle:
-                    handle.write(data)
-        except (HTTPError, URLError, TimeoutError, SocketTimeout) as exc:  # type: ignore[arg-type]
-            error_msg = str(exc)
-        except Exception as exc:  # pragma: no cover - safety net
-            if requests is not None and isinstance(exc, requests.RequestException):
-                error_msg = str(exc)
-            else:
-                error_msg = f"Unexpected error: {exc}"
-        else:
-            return True, None
+            proc = subprocess.run(
+                cmd,
+                stdout=subprocess.PIPE,
+                stderr=subprocess.PIPE,
+                text=True,
+            )
+            if proc.returncode == 0:
+                tmp_path.replace(destination)
+                return True, None
+
+            # Non-zero exit: capture stderr for debugging
+            error_msg = (proc.stderr or proc.stdout or "").strip()
+            if not error_msg:
+                error_msg = f"wget failed with return code {proc.returncode}"
+        except Exception as exc:  # pragma: no cover
+            error_msg = f"Unexpected error running wget: {exc}"
+        finally:
+            # Clean partial file if exists and download failed
+            if tmp_path.exists() and not destination.exists():
+                try:
+                    tmp_path.unlink()
+                except Exception:
+                    pass
 
         if attempt == attempts:
             return False, error_msg
+
         time.sleep(retry_delay * attempt)
 
     return False, "Unknown download error"
+
+
+
+def iter_evqa_image_urls(kb_path: Path, *, chunk_size: int = 1024 * 1024) -> Iterator[str]:
+    """Yield image URLs from the E-VQA encyclopedic KB JSON."""
+
+    for _, payload in iter_json_object_items(kb_path, chunk_size=chunk_size):
+        if not isinstance(payload, dict):
+            continue
+        urls = payload.get("image_urls")
+        if not isinstance(urls, list):
+            continue
+        for url in urls:
+            if isinstance(url, str):
+                stripped = url.strip()
+                if stripped:
+                    yield stripped
+
+
+def count_evqa_image_urls(kb_path: Path, *, chunk_size: int = 1024 * 1024) -> int:
+    """Count image URLs in the E-VQA encyclopedic KB JSON."""
+
+    total = 0
+    for _ in iter_evqa_image_urls(kb_path, chunk_size=chunk_size):
+        total += 1
+    return total
+
+
+def download_images_for_urls(
+    urls: Iterable[str],
+    *,
+    image_dir: Path,
+    max_workers: int = 8,
+    timeout: int = 10,
+    skip_existing: bool = True,
+    user_agent: str = "UniMemRAG-ImageFetcher/1.0",
+    retries: int = 3,
+    retry_delay: float = 1.5,
+    chunk_size: int = 64 * 1024,
+    show_progress: bool = True,
+    progress_desc: str = "Downloading images",
+    total: Optional[int] = None,
+) -> Dict[str, int]:
+    """Download images from an iterable of URLs."""
+
+    image_dir.mkdir(parents=True, exist_ok=True)
+    total_urls = 0
+    queued = 0
+    skipped_existing = 0
+    duplicates = 0
+    successes = 0
+    failures = 0
+    seen: Set[str] = set()
+
+    progress = None
+    if show_progress and tqdm is not None:
+        progress = tqdm(total=total, desc=progress_desc, leave=False)
+
+    def handle_future(future) -> None:
+        nonlocal successes, failures
+        success, _error = future.result()
+        if success:
+            successes += 1
+        else:
+            failures += 1
+        if progress is not None:
+            progress.update(1)
+
+    futures = set()
+    with ThreadPoolExecutor(max_workers=max_workers) as executor:
+        for url in urls:
+            total_urls += 1
+            filename = _filename_from_url(url)
+            if filename in seen:
+                duplicates += 1
+                if progress is not None:
+                    progress.update(1)
+                continue
+            seen.add(filename)
+
+            destination = image_dir / filename
+            if skip_existing and destination.exists():
+                skipped_existing += 1
+                if progress is not None:
+                    progress.update(1)
+                continue
+
+            future = executor.submit(
+                _download_single_image,
+                url,
+                destination,
+                timeout=timeout,
+                user_agent=user_agent,
+                retries=retries,
+                retry_delay=retry_delay,
+                chunk_size=chunk_size,
+            )
+            futures.add(future)
+            queued += 1
+
+            if len(futures) >= max_workers * 4:
+                done, futures = wait(futures, return_when=FIRST_COMPLETED)
+                for finished in done:
+                    handle_future(finished)
+
+        if futures:
+            done, _ = wait(futures)
+            for finished in done:
+                handle_future(finished)
+
+    if progress is not None:
+        progress.close()
+
+    return {
+        "urls": total_urls,
+        "unique_urls": len(seen),
+        "queued": queued,
+        "downloaded": successes,
+        "failed": failures,
+        "skipped_existing": skipped_existing,
+        "duplicates": duplicates,
+    }
 
 
 def download_images_for_entries(
@@ -401,15 +669,70 @@ def write_jsonl(entries: Iterable[Dict], output_path: Path) -> None:
             handle.write("\n")
 
 
+def write_evqa_kb_with_local_paths(
+    kb_path: Path,
+    output_path: Path,
+    *,
+    image_dir: Path,
+    chunk_size: int = 1024 * 1024,
+) -> None:
+    """Write an E-VQA KB JSON with local image paths added."""
+
+    output_path.parent.mkdir(parents=True, exist_ok=True)
+    with output_path.open("w", encoding="utf-8") as handle:
+        handle.write("{\n")
+        first = True
+        for key, payload in iter_json_object_items(kb_path, chunk_size=chunk_size):
+            if isinstance(payload, dict):
+                urls = payload.get("image_urls")
+                if isinstance(urls, list):
+                    local_paths = []
+                    for url in urls:
+                        if isinstance(url, str):
+                            stripped = url.strip()
+                        else:
+                            stripped = ""
+                        if stripped:
+                            destination = image_dir / _filename_from_url(stripped)
+                            if destination.exists():
+                                local_paths.append(_relative_to(destination, image_dir))
+                            else:
+                                local_paths.append(None)
+                        else:
+                            local_paths.append(None)
+                    payload = dict(payload)
+                    payload["local_image_paths"] = local_paths
+
+            if not first:
+                handle.write(",\n")
+            handle.write(json.dumps(key, ensure_ascii=True))
+            handle.write(": ")
+            handle.write(json.dumps(payload, ensure_ascii=True))
+            first = False
+        handle.write("\n}\n")
+
+
 def parse_args() -> argparse.Namespace:
-    parser = argparse.ArgumentParser(description="Sample InfoSeek KB entries with validation coverage.")
-    parser.add_argument("--kb", required=True, help="Path to Wiki6M_ver_1_0.jsonl")
+    parser = argparse.ArgumentParser(
+        description="Sample InfoSeek KB entries or download images for E-VQA KBs."
+    )
+    parser.add_argument(
+        "--kb",
+        help="Path to Wiki6M_ver_1_0.jsonl (required unless --evqa-kb is provided)",
+    )
     parser.add_argument(
         "--val-mapping",
-        required=True,
         help="Path to infoseek_val_withkb.jsonl containing (data_id, entity_id)",
     )
-    parser.add_argument("--output", required=True, help="Destination JSONL file")
+    parser.add_argument("--output", help="Destination JSONL file (InfoSeek mode)")
+    parser.add_argument(
+        "--evqa-kb",
+        help="Path to encyclopedic_kb_wiki.json to download E-VQA images",
+    )
+    parser.add_argument(
+        "--evqa-output",
+        help="Optional output JSON path to add local_image_paths for E-VQA entries",
+    )
     parser.add_argument(
         "--sample-size",
         type=int,
@@ -424,12 +747,12 @@ def parse_args() -> argparse.Namespace:
     )
     parser.add_argument(
         "--image-dir",
-        help="Directory where downloaded images will be stored. Required when --download-images is set.",
+        help="Directory where downloaded images will be stored. Required for --download-images or --evqa-kb.",
     )
     parser.add_argument(
         "--download-images",
         action="store_true",
-        help="Download Wikipedia images for sampled entries (requires --image-dir).",
+        help="Download images for InfoSeek or E-VQA entries (requires --image-dir).",
     )
     parser.add_argument("--max-workers", type=int, default=16, help="Parallel workers for image download.")
     parser.add_argument("--timeout", type=int, default=10, help="Per-request timeout (seconds) for image download.")
@@ -461,15 +784,82 @@ def parse_args() -> argparse.Namespace:
         action="store_true",
         help="Disable progress bar during image downloads.",
     )
+    parser.add_argument(
+        "--download-backend",
+        choices=["wget", "requests"],
+        default="wget",
+        help="Image download backend (default: wget).",
+    )
     return parser.parse_args()
 
 
 def main() -> None:
     args = parse_args()
+    image_dir = _resolve_path(args.image_dir) if args.image_dir else None
+
+    if args.evqa_kb:
+        if args.kb or args.val_mapping or args.output:
+            raise ValueError("Use either InfoSeek inputs or --evqa-kb, not both.")
+        if args.evqa_output and not image_dir:
+            raise ValueError("--evqa-output requires --image-dir")
+        if args.download_images and image_dir is None:
+            raise ValueError("--download-images requires --image-dir")
+        if not args.download_images and not args.evqa_output:
+            raise ValueError("E-VQA mode requires --download-images and/or --evqa-output.")
+
+        evqa_kb_path = _resolve_path(args.evqa_kb)
+        if not evqa_kb_path.is_file():
+            raise FileNotFoundError(f"E-VQA KB JSON not found: {evqa_kb_path}")
+        if image_dir is None:
+            raise ValueError("--evqa-kb requires --image-dir")
+
+        if args.download_images:
+            total_urls = None
+            if not args.no_progress and tqdm is not None:
+                print("Counting E-VQA image URLs for progress bar...")
+                total_urls = count_evqa_image_urls(evqa_kb_path)
+            download_stats = download_images_for_urls(
+                iter_evqa_image_urls(evqa_kb_path),
+                image_dir=image_dir,
+                max_workers=args.max_workers,
+                timeout=args.timeout,
+                skip_existing=not args.no_skip_existing,
+                retries=max(0, args.download_retries),
+                retry_delay=max(0.1, args.retry_delay),
+                chunk_size=max(1024, args.chunk_size),
+                show_progress=not args.no_progress,
+                progress_desc="Downloading E-VQA images",
+                total=total_urls,
+            )
+            print(
+                "E-VQA image download stats: "
+                f"urls={download_stats['urls']} unique={download_stats['unique_urls']} "
+                f"queued={download_stats['queued']} downloaded={download_stats['downloaded']} "
+                f"failed={download_stats['failed']} skipped_existing={download_stats['skipped_existing']} "
+                f"duplicates={download_stats['duplicates']}"
+            )
+
+        if args.evqa_output:
+            evqa_output_path = _resolve_path(args.evqa_output)
+            write_evqa_kb_with_local_paths(
+                evqa_kb_path,
+                evqa_output_path,
+                image_dir=image_dir,
+            )
+            print(f"Wrote E-VQA KB with local image paths to {evqa_output_path}")
+
+        if image_dir:
+            print(f"Image directory: {image_dir}")
+        return
+
+    if args.evqa_output:
+        raise ValueError("--evqa-output requires --evqa-kb")
+
+    if not args.kb or not args.val_mapping or not args.output:
+        raise ValueError("--kb, --val-mapping, and --output are required for InfoSeek mode.")
     kb_path = _resolve_path(args.kb)
     mapping_path = _resolve_path(args.val_mapping)
     output_path = _resolve_path(args.output)
-    image_dir = _resolve_path(args.image_dir) if args.image_dir else None
 
     if not kb_path.is_file():
         raise FileNotFoundError(f"Knowledge base JSONL not found: {kb_path}")
