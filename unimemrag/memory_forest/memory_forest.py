@@ -1712,7 +1712,6 @@ def _build_summary_messages(
     *,
     section_title: str = "",
     max_leaf_texts: Optional[int] = None,
-    max_chars_per_leaf: int = 1200,
 ) -> List[Dict[str, str]]:
     texts = [t.strip() for t in (leaf_texts or []) if isinstance(t, str) and t.strip()]
     if not texts:
@@ -1721,24 +1720,13 @@ def _build_summary_messages(
     if max_leaf_texts is not None and max_leaf_texts > 0:
         texts = texts[:max_leaf_texts]
 
-    clipped: List[str] = []
-    for text in texts:
-        clipped.append(text[:max_chars_per_leaf] if max_chars_per_leaf and max_chars_per_leaf > 0 else text)
-
-    title_part = f"Section title: {section_title.strip()}\n" if section_title and section_title.strip() else ""
-    joined = "\n".join(f"{idx + 1}. {text}" for idx, text in enumerate(clipped))
+    joined = "\n".join(f"{idx + 1}. {text}" for idx, text in enumerate(texts))
     prompt = (
-        "You are a careful summarizer.\n"
-        "Given the following wiki paragraphs (leaf node texts), write a concise summary.\n"
-        "Requirements:\n"
-        "- Output ONLY the summary text, no bullet points, no quotes.\n\n"
-        f"{title_part}"
-        "Paragraphs:\n"
-        f"{joined}\n"
+        f"{joined}\n\n/no_think"
     )
 
     return [
-        {"role": "system", "content": "You are a helpful summarizer."},
+        {"role": "system", "content": "You are a helpful summarizer. Given the following wiki paragraphs, write a concise summary. /no_think"},
         {"role": "user", "content": prompt},
     ]
 
@@ -1750,7 +1738,6 @@ def summarize_event_with_llm(
     model: str,
     section_title: str = "",
     max_leaf_texts: Optional[int] = None,
-    max_chars_per_leaf: int = 1200,
     request_kwargs: Optional[Dict[str, Any]] = None,
 ) -> str:
     """
@@ -1766,7 +1753,6 @@ def summarize_event_with_llm(
         leaf_texts,
         section_title=section_title,
         max_leaf_texts=max_leaf_texts,
-        max_chars_per_leaf=max_chars_per_leaf,
     )
     if not messages:
         return ""
@@ -1807,7 +1793,6 @@ def summarize_events_with_llm_batch(
     llm: Any,
     model: str,
     max_leaf_texts: Optional[int] = None,
-    max_chars_per_leaf: int = 1200,
     request_kwargs: Optional[Dict[str, Any]] = None,
     batch_size: int = 8,
     show_progress: bool = True,
@@ -1835,7 +1820,6 @@ def summarize_events_with_llm_batch(
             leaf_texts,
             section_title=str(spec.get("section_title") or ""),
             max_leaf_texts=max_leaf_texts,
-            max_chars_per_leaf=max_chars_per_leaf,
         )
         if not messages:
             continue

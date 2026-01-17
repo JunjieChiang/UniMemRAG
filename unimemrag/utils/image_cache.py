@@ -156,13 +156,48 @@ def download_images_for_kb(
 def replace_payload_image_urls(
     payload: Dict[str, Any],
     url_map: Mapping[str, str],
+    used_for_tree: bool = False,
 ) -> Dict[str, Any]:
     """
-    Replace the image URLs inside ``payload`` using a {url: local_path} map.
+    Replace image URLs in payload using a {url: local_path} map.
+
+    - used_for_tree = False (default):
+        Only replace `image_urls` if it exists (wiki KB).
+    - used_for_tree = True:
+        Replace `image_urls`, `image_candidates`, and `section_images`
+        if they exist (tree KB).
     """
-    image_urls = payload.get("image_urls") or []
-    payload["image_urls"] = [url_map.get(url, url) for url in image_urls]
-    return payload
+
+    def _replace_list_in(d: Dict[str, Any], key: str):
+        if key in d and isinstance(d[key], list):
+            d[key] = [url_map.get(u, u) for u in d[key]]
+
+    def _replace_str_in(d: Dict[str, Any], key: str):
+        if key in d and isinstance(d[key], str):
+            d[key] = url_map.get(d[key], d[key])
+
+    if not used_for_tree:
+        # 原始 wiki KB：只处理 image_urls
+        _replace_list_in(payload, "image_urls")
+        return payload
+    else:
+        # tree KB：三个字段独立替换
+        root = payload.get("root")
+        if isinstance(root, dict):
+            _replace_str_in(root, "image_uri")
+            _replace_list_in(root, "image_candidates")
+            _replace_list_in(root, "image_urls")  # 兼容：如果 tree 里也有
+
+        events = payload.get("events")
+        if isinstance(events, list):
+            for ev in events:
+                if not isinstance(ev, dict):
+                    continue
+                md = ev.get("metadata")
+                if isinstance(md, dict):
+                    _replace_list_in(md, "section_images")
+
+        return payload
 
 
 def save_image_cache(mapping: Mapping[str, str], path: Path) -> None:

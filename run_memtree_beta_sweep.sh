@@ -18,16 +18,18 @@ BETA_START="${BETA_START:-0.0}"
 BETA_END="${BETA_END:-1.0}"
 BETA_STEP="${BETA_STEP:-0.1}"
 SLEEP_SECS="${SLEEP_SECS:-60}"
+INGEST_MULTI_GPU="${INGEST_MULTI_GPU:-1}"
+INGEST_MASTER_PORT="${INGEST_MASTER_PORT:-29500}"
 
-TREES_JSON="${TREES_JSON:-examples/trees_5k.json}"
+TREES_JSON="${TREES_JSON:-examples/trees_all_new.json}"
 COLLECTION="${COLLECTION:-memtree}"
 CLIP_MODEL="${CLIP_MODEL:-../ckpts/clip-vit-large-patch14}"
-# LEAF_TEXT_MODEL="${LEAF_TEXT_MODEL-../ckpts/Qwen3-Embedding-0.6B}"
-LEAF_TEXT_MODEL="${LEAF_TEXT_MODEL:-}"
-INGEST_BATCH_SIZE="${INGEST_BATCH_SIZE:-32}"
+LEAF_TEXT_MODEL="${LEAF_TEXT_MODEL-../ckpts/Qwen3-Embedding-0.6B}"
+# LEAF_TEXT_MODEL="${LEAF_TEXT_MODEL:-}"
+INGEST_BATCH_SIZE="${INGEST_BATCH_SIZE:-64}"
 TEXT_WORKERS="${TEXT_WORKERS:-1}"
 IMAGE_WORKERS="${IMAGE_WORKERS:-8}"
-TEXT_BATCH_SIZE="${TEXT_BATCH_SIZE:-8}"
+TEXT_BATCH_SIZE="${TEXT_BATCH_SIZE:-32}"
 LEAF_TEXT_WORKERS="${LEAF_TEXT_WORKERS:-${TEXT_WORKERS}}"
 LEAF_TEXT_DEVICE="${LEAF_TEXT_DEVICE:-cuda:auto}"
 TWO_STAGE="${TWO_STAGE:-1}"
@@ -44,7 +46,7 @@ PREFETCH_BATCHES="${PREFETCH_BATCHES:-2}"
 RETRIEVAL_WORKERS="${RETRIEVAL_WORKERS:-8}"
 ROOT_TOP_K="${ROOT_TOP_K:-3}"
 EVENT_TOP_K="${EVENT_TOP_K:-3}"
-ALPHA="${ALPHA:-0.05}"
+ALPHA="${ALPHA:-0.1}"
 MAX_TREES="${MAX_TREES:-5}"
 MAX_SECTIONS="${MAX_SECTIONS:-5}"
 MAX_LEAVES="${MAX_LEAVES:-5}"
@@ -57,6 +59,7 @@ LOG_TO_FILE="${LOG_TO_FILE:-0}"
 
 IFS=' ' read -r -a GPU_ID_ARR <<< "${GPU_IDS}"
 NUM_SHARDS="${NUM_SHARDS:-${#GPU_ID_ARR[@]}}"
+INGEST_NPROC="${INGEST_NPROC:-${NUM_SHARDS}}"
 
 generate_betas() {
   if [[ -n "${BETAS}" ]]; then
@@ -84,11 +87,9 @@ PY
 
 build_index() {
   local beta="$1"
-  BETA="${beta}" TREES_JSON="${TREES_JSON}" COLLECTION="${COLLECTION}" CLIP_MODEL="${CLIP_MODEL}" \
-  INGEST_BATCH_SIZE="${INGEST_BATCH_SIZE}" TEXT_WORKERS="${TEXT_WORKERS}" IMAGE_WORKERS="${IMAGE_WORKERS}" \
-  LEAF_TEXT_MODEL="${LEAF_TEXT_MODEL}" LEAF_TEXT_DEVICE="${LEAF_TEXT_DEVICE}" \
-  LEAF_TEXT_WORKERS="${LEAF_TEXT_WORKERS}" TEXT_BATCH_SIZE="${TEXT_BATCH_SIZE}" \
-  python - <<'PY'
+  local ingest_script
+  ingest_script="$(mktemp /tmp/ingest_memtree.XXXXXX.py)"
+  cat > "${ingest_script}" <<'PY'
 import json
 import os
 import sys
@@ -105,14 +106,27 @@ from unimemrag.retriever import ClipEmbedding
 from unimemrag.embedding.models.QwenTextEmbedding import QwenTextEmbedding
 from unimemrag.memory_forest.memory_forest import MemoryForestStore, MemoryTree, RootNode, EventNode, LeafNode
 
+local_rank = int(os.environ.get("LOCAL_RANK", "0"))
+world_size = int(os.environ.get("WORLD_SIZE", "1"))
+
 trees_path = Path(os.environ["TREES_JSON"]).expanduser()
 if not trees_path.exists():
     raise FileNotFoundError(f"Trees JSON not found: {trees_path}")
 
 cfg = Config(collection=os.environ["COLLECTION"])
-embed_model = ClipEmbedding(model_name=os.environ["CLIP_MODEL"])
+
+clip_device = os.environ.get("CLIP_DEVICE")
+if world_size > 1:
+    clip_device = f"cuda:{local_rank}"
+if clip_device:
+    embed_model = ClipEmbedding(model_name=os.environ["CLIP_MODEL"], device=clip_device)
+else:
+    embed_model = ClipEmbedding(model_name=os.environ["CLIP_MODEL"])
+
 leaf_text_model = os.environ.get("LEAF_TEXT_MODEL") or ""
 leaf_text_device = os.environ.get("LEAF_TEXT_DEVICE") or None
+if world_size > 1 and leaf_text_device in (None, "", "auto", "cuda:auto"):
+    leaf_text_device = f"cuda:{local_rank}"
 leaf_text_embedder = None
 leaf_text_vector_size = None
 if leaf_text_model:
@@ -134,10 +148,16 @@ def tree_from_dict(d):
     return MemoryTree(tree_id=d["tree_id"], root=root, events=events, leaves=leaves)
 
 trees = [tree_from_dict(x) for x in data]
+if world_size > 1:
+    trees = [tree for idx, tree in enumerate(trees) if idx % world_size == local_rank]
+if not trees:
+    print(f"[rank {local_rank}] No trees assigned; skip ingest.")
+    sys.exit(0)
 
 beta = float(os.environ["BETA"])
 text_batch_size = os.environ.get("TEXT_BATCH_SIZE") or ""
 text_batch_size = int(text_batch_size) if text_batch_size else None
+show_progress = True if world_size <= 1 else local_rank == 0
 memforest_store.ingest_trees_new(
     trees,
     embed_model,
@@ -148,9 +168,26 @@ memforest_store.ingest_trees_new(
     image_workers=int(os.environ["IMAGE_WORKERS"]),
     leaf_text_embedder=leaf_text_embedder,
     leaf_text_workers=int(os.environ["LEAF_TEXT_WORKERS"]),
-    show_progress=True,
+    show_progress=show_progress,
 )
 PY
+  if [[ "${INGEST_MULTI_GPU}" == "1" && "${INGEST_NPROC}" -gt 1 ]]; then
+    local cuda_visible
+    cuda_visible="$(echo "${GPU_IDS}" | tr ' ' ',')"
+    CUDA_VISIBLE_DEVICES="${cuda_visible}" \
+    BETA="${beta}" TREES_JSON="${TREES_JSON}" COLLECTION="${COLLECTION}" CLIP_MODEL="${CLIP_MODEL}" \
+    INGEST_BATCH_SIZE="${INGEST_BATCH_SIZE}" TEXT_WORKERS="${TEXT_WORKERS}" IMAGE_WORKERS="${IMAGE_WORKERS}" \
+    LEAF_TEXT_MODEL="${LEAF_TEXT_MODEL}" LEAF_TEXT_DEVICE="${LEAF_TEXT_DEVICE}" \
+    LEAF_TEXT_WORKERS="${LEAF_TEXT_WORKERS}" TEXT_BATCH_SIZE="${TEXT_BATCH_SIZE}" \
+    torchrun --nproc_per_node="${INGEST_NPROC}" --master_port="${INGEST_MASTER_PORT}" "${ingest_script}"
+  else
+    BETA="${beta}" TREES_JSON="${TREES_JSON}" COLLECTION="${COLLECTION}" CLIP_MODEL="${CLIP_MODEL}" \
+    INGEST_BATCH_SIZE="${INGEST_BATCH_SIZE}" TEXT_WORKERS="${TEXT_WORKERS}" IMAGE_WORKERS="${IMAGE_WORKERS}" \
+    LEAF_TEXT_MODEL="${LEAF_TEXT_MODEL}" LEAF_TEXT_DEVICE="${LEAF_TEXT_DEVICE}" \
+    LEAF_TEXT_WORKERS="${LEAF_TEXT_WORKERS}" TEXT_BATCH_SIZE="${TEXT_BATCH_SIZE}" \
+    python "${ingest_script}"
+  fi
+  rm -f "${ingest_script}"
 }
 
 delete_index() {
@@ -211,7 +248,7 @@ for beta in "${BETAS_LIST[@]}"; do
     run_id="beta_${beta}_top${leaf_top_k}"
     shard_dir="${SHARD_DIR_BASE}/${run_id}"
     output_dir="${OUTPUT_DIR_BASE}/${run_id}"
-    merged_path="infoseek_memtree_predictions_all_collapsed_beta_${beta}_update_top${leaf_top_k}.jsonl"
+    merged_path="infoseek_memtree_predictions_all_collapsed_full_beta_${beta}_update_top${leaf_top_k}.jsonl"
 
     rm -f "${shard_dir}"/part_* 2>/dev/null || true
     rm -f "${output_dir}"/pred_*.jsonl "${output_dir}"/log_*.txt 2>/dev/null || true

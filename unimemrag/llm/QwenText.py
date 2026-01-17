@@ -24,7 +24,6 @@ class QwenText:
             device_map=device_map,
             trust_remote_code=trust_remote_code,
         )
-        self.tokenizer.padding_side = "left"
         if self.tokenizer.pad_token_id is None:
             self.tokenizer.pad_token_id = self.tokenizer.eos_token_id
         self.model.eval()
@@ -48,7 +47,7 @@ class QwenText:
             )
             for messages in messages_list
         ]
-        model_inputs = self.tokenizer(prompts, return_tensors="pt", padding=True).to(self.model.device)
+        model_inputs = self.tokenizer(prompts, return_tensors="pt", padding=True, padding_side="left").to(self.model.device)
         attention_mask = model_inputs.get("attention_mask")
         input_ids = model_inputs["input_ids"]
 

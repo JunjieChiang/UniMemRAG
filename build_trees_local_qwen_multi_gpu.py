@@ -1,7 +1,7 @@
 '''
 python build_trees_local_qwen_multi_gpu.py \
   --kb-path ../benchmark/infoseek/wiki_100_dict_v4.json \
-  --output-dir examples/tree/ \
+  --output-dir examples/tree_infoseek/ \
   --gpu-ids 0,1,2,3,4,5,6,7 \
   --workers-per-gpu 1 \
   --shard-dir examples/kb_shards \
@@ -10,6 +10,11 @@ python build_trees_local_qwen_multi_gpu.py \
   --max-new-tokens 256 \
   --show-progress \
   --overwrite
+
+python build_trees_local_qwen_multi_gpu.py \
+  --mode merge \
+  --merge-dir examples/tree \
+  --merged-path examples/trees_all.json
 
 CUDA_VISIBLE_DEVICES=0 python build_trees_local_qwen_multi_gpu.py \
   --mode worker \
@@ -26,6 +31,7 @@ CUDA_VISIBLE_DEVICES=0 python build_trees_local_qwen_multi_gpu.py \
   --tqdm-position 0 \
   --show-progress \
   --overwrite
+
 
 '''
 
@@ -139,6 +145,36 @@ def _prepare_kb_shards(
             json.dump(shards[shard_idx], fh, ensure_ascii=False)
 
     return shard_paths
+
+
+def _merge_shard_outputs(
+    merge_dir: str,
+    *,
+    output_path: str,
+    pattern: str,
+    indent: Optional[int] = None,
+) -> None:
+    shard_root = Path(merge_dir).expanduser()
+    if not shard_root.exists():
+        raise FileNotFoundError(f"Merge directory not found: {shard_root}")
+
+    shard_files = sorted(shard_root.glob(pattern))
+    if not shard_files:
+        raise FileNotFoundError(f"No shard files matched {pattern} in {shard_root}")
+
+    records: List[Dict[str, Any]] = []
+    for shard_file in shard_files:
+        with shard_file.open("r", encoding="utf-8") as fh:
+            for line in fh:
+                line = line.strip()
+                if not line:
+                    continue
+                records.append(json.loads(line))
+
+    output_path_obj = Path(output_path).expanduser()
+    output_path_obj.parent.mkdir(parents=True, exist_ok=True)
+    with output_path_obj.open("w", encoding="utf-8") as fh:
+        json.dump(records, fh, ensure_ascii=False, indent=indent)
 
 
 def _count_shard_total(total: int, shard_index: int, shard_count: int) -> int:
@@ -372,10 +408,10 @@ def _launch_workers(
 
 def main() -> None:
     parser = argparse.ArgumentParser(description="Build memory trees with local Qwen3 across multiple GPUs.")
-    parser.add_argument("--kb-path", required=True, help="Path to wiki-style KB JSON.")
-    parser.add_argument("--output-dir", required=True, help="Directory to write shard outputs.")
+    parser.add_argument("--kb-path", default=None, help="Path to wiki-style KB JSON.")
+    parser.add_argument("--output-dir", default=None, help="Directory to write shard outputs.")
     parser.add_argument("--output-prefix", default="trees", help="Prefix for output shard files.")
-    parser.add_argument("--mode", choices=["launch", "worker"], default="launch", help="Launch or worker mode.")
+    parser.add_argument("--mode", choices=["launch", "worker", "merge"], default="launch", help="Launch or worker mode.")
     parser.add_argument("--gpu-ids", default="0", help="Comma/space-separated GPU ids.")
     parser.add_argument("--workers-per-gpu", type=int, default=1, help="Number of workers per GPU.")
     parser.add_argument("--limit", type=int, default=None, help="Process only the first N items (global index).")
@@ -388,6 +424,10 @@ def main() -> None:
     parser.add_argument("--gpu-id", type=int, default=None, help="GPU id label for worker output naming.")
     parser.add_argument("--worker-id", type=int, default=None, help="Worker id label for worker output naming.")
     parser.add_argument("--tqdm-position", type=int, default=0, help="tqdm position for worker progress bar.")
+    parser.add_argument("--merge-dir", default=None, help="Merge: directory containing shard jsonl files.")
+    parser.add_argument("--merged-path", default=None, help="Merge: output JSON file path.")
+    parser.add_argument("--merge-pattern", default=None, help="Merge: glob for shard jsonl files.")
+    parser.add_argument("--merge-indent", type=int, default=None, help="Merge: JSON indent for output.")
 
     parser.add_argument("--llm-model", default="Qwen/Qwen3-8B", help="Local Qwen model name or path.")
     parser.add_argument("--torch-dtype", default="auto", help="Torch dtype (e.g., auto, bfloat16).")
@@ -411,6 +451,21 @@ def main() -> None:
     parser.add_argument("--show-progress", action="store_true", help="Show per-GPU progress bars.")
 
     args = parser.parse_args()
+
+    if args.mode == "merge":
+        if not args.merge_dir or not args.merged_path:
+            raise ValueError("--merge-dir and --merged-path are required in merge mode.")
+        pattern = args.merge_pattern or f"{args.output_prefix}_*.jsonl"
+        _merge_shard_outputs(
+            args.merge_dir,
+            output_path=args.merged_path,
+            pattern=pattern,
+            indent=args.merge_indent,
+        )
+        return
+
+    if not args.kb_path or not args.output_dir:
+        raise ValueError("--kb-path and --output-dir are required for launch/worker modes.")
 
     if args.mode == "launch":
         gpu_ids = _parse_gpu_ids(args.gpu_ids)
