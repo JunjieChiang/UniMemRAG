@@ -289,6 +289,7 @@ class Qwen:
                 messages,
                 tokenize=False,
                 add_generation_prompt=True,
+                enable_thinking=False,
             )
             for messages in messages_list
         ]
@@ -325,9 +326,10 @@ def format_collapsed_context(
     ]
     for event in tree_result.events[:max_sections]:
         emeta = event.payload.get("metadata", {}) or {}
-        title = emeta.get("section_title") or event.payload.get("summary") or "Unknown section"
+        summary_text = (event.payload.get("summary") or "").strip()
+        title = (str(emeta.get("section_title") or "")).strip() or summary_text or "Unknown section"
         lines.append(f"Section: {title}")
-        section_summary = (event.payload.get("summary") or "").strip()
+        section_summary = summary_text
         if section_summary:
             lines.append(section_summary)
         leaf_hits = tree_result.leaves.get(event.id, [])
@@ -465,7 +467,8 @@ def run_infoseek_evaluation(
         if show_progress and hasattr(iterator, "write"):
             iterator.write(message)
         else:
-            print(message)
+            # print(message)
+            pass
 
     def _flush_batch() -> None:
         nonlocal pending_examples, pending_messages, skipped

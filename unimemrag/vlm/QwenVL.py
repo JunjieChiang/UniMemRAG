@@ -129,7 +129,7 @@ class QwenVL:
     def _apply_template(self, messages: Messages) -> str:
         """将 messages 应用 chat 模板为单轮文本提示（由 processor 管理 BOS/EOS 等）。"""
         return self.processor.apply_chat_template(
-            messages, tokenize=False, add_generation_prompt=True
+            messages, tokenize=False, add_generation_prompt=True,
         )
 
     def _prepare_inputs(

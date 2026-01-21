@@ -302,9 +302,31 @@ class MemoryForestStore(QdrantStore):
 
         embed_progress = None
         if show_progress and tqdm is not None:
+            leaf_counts_by_event: Dict[str, int] = defaultdict(int)
+            for leaf in leaf_entries:
+                parent_id = leaf.get("parent_id")
+                if parent_id:
+                    leaf_counts_by_event[str(parent_id)] += 1
+            event_summary_count = sum(
+                1 for entry in event_entries if str(entry.get("summary") or "").strip()
+            )
+            event_fallback_count = 0
+            for entry in event_entries:
+                if str(entry.get("summary") or "").strip():
+                    continue
+                event_id = str(entry.get("event_id") or "")
+                if leaf_counts_by_event.get(event_id, 0) > 0:
+                    continue
+                metadata = entry.get("metadata") or {}
+                fallback_text = str(
+                    metadata.get("section_title") or metadata.get("section_preview") or ""
+                ).strip()
+                if fallback_text:
+                    event_fallback_count += 1
             total_embeddings = (
                 len(leaf_entries)
-                + len(event_entries)
+                + event_summary_count
+                + event_fallback_count
                 + len(root_entries) * 2
                 + sum(len(entry.get("image_candidates") or []) for entry in root_entries)
             )
@@ -318,12 +340,75 @@ class MemoryForestStore(QdrantStore):
             progress_bar=embed_progress,
             num_workers=text_workers,
         )
-        event_vectors = self._embed_texts(
-            [entry["summary"] for entry in event_entries],
-            embedder,
-            batch_size,
-            progress_bar=embed_progress,
-            num_workers=text_workers,
+
+        leaf_indices_by_event: Dict[str, List[int]] = defaultdict(list)
+        for idx, entry in enumerate(leaf_entries):
+            parent_id = entry.get("parent_id")
+            if parent_id:
+                leaf_indices_by_event[str(parent_id)].append(idx)
+
+        event_vectors_full = np.zeros((len(event_entries), embedder.dim), dtype=np.float32)
+        summary_indices: List[int] = []
+        summary_texts: List[str] = []
+        fallback_indices: List[int] = []
+        fallback_texts: List[str] = []
+
+        for idx, entry in enumerate(event_entries):
+            summary = str(entry.get("summary") or "").strip()
+            if summary:
+                summary_indices.append(idx)
+                summary_texts.append(summary)
+                continue
+
+            event_id = str(entry.get("event_id") or "")
+            leaf_indices = leaf_indices_by_event.get(event_id, [])
+            if leaf_indices:
+                vec = leaf_vectors[leaf_indices].mean(axis=0)
+                norm = float(np.linalg.norm(vec))
+                if norm > 1e-12:
+                    event_vectors_full[idx] = (vec / norm).astype(np.float32)
+                continue
+
+            metadata = entry.get("metadata") or {}
+            fallback = str(metadata.get("section_title") or metadata.get("section_preview") or "").strip()
+            if fallback:
+                fallback_indices.append(idx)
+                fallback_texts.append(fallback)
+
+        if summary_texts:
+            embedded = self._embed_texts(
+                summary_texts,
+                embedder,
+                batch_size,
+                progress_bar=embed_progress,
+                num_workers=text_workers,
+            )
+            for out_idx, vec in zip(summary_indices, embedded):
+                event_vectors_full[out_idx] = vec.astype(np.float32)
+
+        if fallback_texts:
+            embedded = self._embed_texts(
+                fallback_texts,
+                embedder,
+                batch_size,
+                progress_bar=embed_progress,
+                num_workers=text_workers,
+            )
+            for out_idx, vec in zip(fallback_indices, embedded):
+                event_vectors_full[out_idx] = vec.astype(np.float32)
+
+        upsert_event_vectors: List[np.ndarray] = []
+        upsert_event_entries: List[Dict[str, Any]] = []
+        for idx, entry in enumerate(event_entries):
+            vec = event_vectors_full[idx]
+            if float(np.linalg.norm(vec)) <= 1e-12:
+                continue
+            upsert_event_vectors.append(vec.astype(np.float32))
+            upsert_event_entries.append(entry)
+        event_vectors = (
+            np.vstack(upsert_event_vectors).astype(np.float32)
+            if upsert_event_vectors
+            else np.empty((0, embedder.dim), dtype=np.float32)
         )
         root_text_vectors = self._embed_texts(
             [entry["topic"] for entry in root_entries],
@@ -364,14 +449,14 @@ class MemoryForestStore(QdrantStore):
         fused_root_array = np.vstack(fused_root_vectors).astype(np.float32)
 
         self._upsert_roots(fused_root_array, root_entries)
-        self._upsert_events(event_vectors, event_entries)
+        self._upsert_events(event_vectors, upsert_event_entries)
         self._upsert_leaves(leaf_vectors, leaf_entries)
         if embed_progress is not None:
             embed_progress.close()
 
         return {
             "roots": len(root_entries),
-            "events": len(event_entries),
+            "events": len(upsert_event_entries),
             "leaves": len(leaf_entries),
         }
 
@@ -426,6 +511,27 @@ class MemoryForestStore(QdrantStore):
 
         embed_progress = None
         if show_progress and tqdm is not None:
+            leaf_counts_by_event: Dict[str, int] = defaultdict(int)
+            for leaf in leaf_entries:
+                parent_id = leaf.get("parent_id")
+                if parent_id:
+                    leaf_counts_by_event[str(parent_id)] += 1
+            event_summary_count = sum(
+                1 for entry in event_entries if str(entry.get("summary") or "").strip()
+            )
+            event_fallback_count = 0
+            for entry in event_entries:
+                if str(entry.get("summary") or "").strip():
+                    continue
+                event_id = str(entry.get("event_id") or "")
+                if leaf_counts_by_event.get(event_id, 0) > 0:
+                    continue
+                metadata = entry.get("metadata") or {}
+                fallback_text = str(
+                    metadata.get("section_title") or metadata.get("section_preview") or ""
+                ).strip()
+                if fallback_text:
+                    event_fallback_count += 1
             event_image_candidates = 0
             for entry in event_entries:
                 candidates = (entry.get("metadata") or {}).get("section_images") or []
@@ -435,7 +541,8 @@ class MemoryForestStore(QdrantStore):
                     event_image_candidates += len(candidates)
             total_embeddings = (
                 len(leaf_entries)
-                + len(event_entries)
+                + event_summary_count
+                + event_fallback_count
                 + len(root_entries) * 2
                 + sum(len(entry.get("image_candidates") or []) for entry in root_entries)
                 + event_image_candidates
@@ -448,7 +555,7 @@ class MemoryForestStore(QdrantStore):
                     desc="Embedding Trees (fused leaves)",
                     leave=False,
                 )
-
+        print("Start to embed leaf texts")
         leaf_text_vectors = self._embed_texts(
             [entry["text"] for entry in leaf_entries],
             embedder,
@@ -456,13 +563,80 @@ class MemoryForestStore(QdrantStore):
             progress_bar=embed_progress,
             num_workers=text_workers,
         )
-        event_vectors = self._embed_texts(
-            [entry["summary"] for entry in event_entries],
-            embedder,
-            mm_batch_size,
-            progress_bar=embed_progress,
-            num_workers=text_workers,
+
+        leaf_indices_by_event: Dict[str, List[int]] = defaultdict(list)
+        for idx, entry in enumerate(leaf_entries):
+            parent_id = entry.get("parent_id")
+            if parent_id:
+                leaf_indices_by_event[str(parent_id)].append(idx)
+
+        event_text_vectors_full = np.zeros((len(event_entries), embedder.dim), dtype=np.float32)
+        summary_indices: List[int] = []
+        summary_texts: List[str] = []
+        fallback_indices: List[int] = []
+        fallback_texts: List[str] = []
+
+        for idx, entry in enumerate(event_entries):
+            summary = str(entry.get("summary") or "").strip()
+            if summary:
+                summary_indices.append(idx)
+                summary_texts.append(summary)
+                continue
+
+            event_id = str(entry.get("event_id") or "")
+            leaf_indices = leaf_indices_by_event.get(event_id, [])
+            if leaf_indices:
+                vec = leaf_text_vectors[leaf_indices].mean(axis=0)
+                norm = float(np.linalg.norm(vec))
+                if norm > 1e-12:
+                    event_text_vectors_full[idx] = (vec / norm).astype(np.float32)
+                continue
+
+            metadata = entry.get("metadata") or {}
+            fallback = str(metadata.get("section_title") or metadata.get("section_preview") or "").strip()
+            if fallback:
+                fallback_indices.append(idx)
+                fallback_texts.append(fallback)
+
+        if summary_texts:
+            print("Start to embed summary texts")
+            embedded = self._embed_texts(
+                summary_texts,
+                embedder,
+                mm_batch_size,
+                progress_bar=embed_progress,
+                num_workers=text_workers,
+            )
+            for out_idx, vec in zip(summary_indices, embedded):
+                event_text_vectors_full[out_idx] = vec.astype(np.float32)
+
+        if fallback_texts:
+            print("Start to embed fallback texts")
+            embedded = self._embed_texts(
+                fallback_texts,
+                embedder,
+                mm_batch_size,
+                progress_bar=embed_progress,
+                num_workers=text_workers,
+            )
+            for out_idx, vec in zip(fallback_indices, embedded):
+                event_text_vectors_full[out_idx] = vec.astype(np.float32)
+
+        upsert_event_vectors: List[np.ndarray] = []
+        upsert_event_entries: List[Dict[str, Any]] = []
+        for idx, entry in enumerate(event_entries):
+            vec = event_text_vectors_full[idx]
+            if float(np.linalg.norm(vec)) <= 1e-12:
+                continue
+            upsert_event_vectors.append(vec.astype(np.float32))
+            upsert_event_entries.append(entry)
+        event_vectors = (
+            np.vstack(upsert_event_vectors).astype(np.float32)
+            if upsert_event_vectors
+            else np.empty((0, embedder.dim), dtype=np.float32)
         )
+
+        print("Start to embed root texts")
         root_text_vectors = self._embed_texts(
             [entry["topic"] for entry in root_entries],
             embedder,
@@ -470,6 +644,7 @@ class MemoryForestStore(QdrantStore):
             progress_bar=embed_progress,
             num_workers=text_workers,
         )
+        print("Start to embed root alignment texts")
         alignment_texts = [self._build_root_alignment_text(entry["tree"]) for entry in root_entries]
         alignment_vectors = self._embed_texts(
             alignment_texts,
@@ -478,6 +653,7 @@ class MemoryForestStore(QdrantStore):
             progress_bar=embed_progress,
             num_workers=text_workers,
         )
+        print("Start to select root images")
         root_image_vectors = self._select_root_image_vectors(
             root_entries,
             embedder,
@@ -496,10 +672,11 @@ class MemoryForestStore(QdrantStore):
             if vec is not None:
                 root_image_vectors_by_tree[tree_id] = vec
 
+        print("Start to select event images")
         event_image_vectors, event_image_uris = self._select_event_image_vectors(
             event_entries,
             embedder,
-            event_vectors,
+            event_text_vectors_full,
             root_image_vectors_by_tree,
             root_image_uris_by_tree,
             image_batch_size=mm_batch_size,
@@ -533,6 +710,7 @@ class MemoryForestStore(QdrantStore):
 
         leaf_text_only_vectors = None
         if leaf_text_embedder is not None:
+            print("Start to embed leaf texts for text-only vectors")
             leaf_text_only_vectors = self._embed_texts(
                 [entry["text"] for entry in leaf_entries],
                 leaf_text_embedder,
@@ -545,6 +723,8 @@ class MemoryForestStore(QdrantStore):
         for idx, entry in enumerate(root_entries):
             text_vec = root_text_vectors[idx] if len(root_text_vectors) > idx else None
             image_vec = root_image_vectors.get(idx)
+
+            print("Start to compose root vector")
             fused_vec = self._compose_root_vector(
                 tree=entry["tree"],
                 text_vec=text_vec,
@@ -555,15 +735,16 @@ class MemoryForestStore(QdrantStore):
             fused_root_vectors.append(fused_vec)
         fused_root_array = np.vstack(fused_root_vectors).astype(np.float32)
 
+        print("Embedding complete! Start to insert roots, events, leaves into KB")
         self._upsert_roots(fused_root_array, root_entries)
-        self._upsert_events(event_vectors, event_entries)
+        self._upsert_events(event_vectors, upsert_event_entries)
         self._upsert_leaves_fused(fused_leaf_array, leaf_entries, text_vectors=leaf_text_only_vectors)
         if embed_progress is not None:
             embed_progress.close()
 
         return {
             "roots": len(root_entries),
-            "events": len(event_entries),
+            "events": len(upsert_event_entries),
             "leaves": len(leaf_entries),
         }
 
@@ -1365,7 +1546,7 @@ class MemoryForestStore(QdrantStore):
             vector_name=self.leaf_vector_name if self.leaf_has_named_vectors else None,
         )
         stage1_hits = [self._to_hit(point, NodeRole.LEAF, self.leaf_collection) for point in stage1_points]
-        print("Collapsed retrieval stage 1 results", stage1_hits)
+        # print("Collapsed retrieval stage 1 results", stage1_hits)
 
         tree_order: List[str] = []
         tree_scores: Dict[str, float] = {}
@@ -1488,7 +1669,7 @@ class MemoryForestStore(QdrantStore):
                 )
             )
         
-        print("Collapsed retrieval final results:", results)
+        # print("Collapsed retrieval final results:", results)
         return results
 
     def _build_query_vector(

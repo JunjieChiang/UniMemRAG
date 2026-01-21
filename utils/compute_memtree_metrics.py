@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 '''
-python utils/compute_memtree_metrics.py --dir results/v4_leaf_retrieval_vit_l_p14_clip_embedding
+python utils/compute_memtree_metrics.py --dir results/v5_0120
 '''
 
 

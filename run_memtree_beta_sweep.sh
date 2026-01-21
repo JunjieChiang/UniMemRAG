@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 # Sweep beta values, build index, run eval for each LEAF_TOP_K, then delete index.
 '''
-BETAS="1.0 0.9 0.8 0.7 0.6 0.5 0.4 0.3 0.2 0.1 0.0" LEAF_TOP_KS="5 10" SLEEP_SECS=60 TWO_STAGE=1 bash run_memtree_beta_sweep.sh
+BETAS="0.9 0.8 0.7 0.6 0.5 0.4 0.3 0.2 0.1 0.0 1.0" LEAF_TOP_KS="5 10" SLEEP_SECS=60 TWO_STAGE=1 COLLECTION=memtree bash run_memtree_beta_sweep.sh
 '''
 
 set -euo pipefail
@@ -21,28 +21,28 @@ SLEEP_SECS="${SLEEP_SECS:-60}"
 INGEST_MULTI_GPU="${INGEST_MULTI_GPU:-1}"
 INGEST_MASTER_PORT="${INGEST_MASTER_PORT:-29500}"
 
-TREES_JSON="${TREES_JSON:-examples/trees_all_new.json}"
+TREES_JSON="${TREES_JSON:-examples/trees_infoseek.json}"
 COLLECTION="${COLLECTION:-memtree}"
 CLIP_MODEL="${CLIP_MODEL:-../ckpts/clip-vit-large-patch14}"
 LEAF_TEXT_MODEL="${LEAF_TEXT_MODEL-../ckpts/Qwen3-Embedding-0.6B}"
 # LEAF_TEXT_MODEL="${LEAF_TEXT_MODEL:-}"
-INGEST_BATCH_SIZE="${INGEST_BATCH_SIZE:-64}"
+INGEST_BATCH_SIZE="${INGEST_BATCH_SIZE:-8}"
 TEXT_WORKERS="${TEXT_WORKERS:-1}"
-IMAGE_WORKERS="${IMAGE_WORKERS:-8}"
-TEXT_BATCH_SIZE="${TEXT_BATCH_SIZE:-32}"
+IMAGE_WORKERS="${IMAGE_WORKERS:-4}"
+TEXT_BATCH_SIZE="${TEXT_BATCH_SIZE:-4}"
 LEAF_TEXT_WORKERS="${LEAF_TEXT_WORKERS:-${TEXT_WORKERS}}"
 LEAF_TEXT_DEVICE="${LEAF_TEXT_DEVICE:-cuda:auto}"
 TWO_STAGE="${TWO_STAGE:-1}"
 ANSWER_MODE="${ANSWER_MODE:-vlm}"
 TEXT_MODEL="${TEXT_MODEL:-../ckpts/Qwen2.5-VL-7B-Instruct}"
 TRUST_REMOTE_CODE="${TRUST_REMOTE_CODE:-1}"
-# DATASET="${DATASET:-../benchmark/infoseek/subset/infoseek_val_5k.jsonl}"
-DATASET="${DATASET:-benchmark/infoseek_val.jsonl}"
+DATASET="${DATASET:-../benchmark/infoseek/subset/infoseek_val_5k.jsonl}"
+# DATASET="${DATASET:-benchmark/infoseek_val.jsonl}"
 IMAGES_ROOT="${IMAGES_ROOT:-../benchmark/oven}"
 IMAGE_INDEX_CSV="${IMAGE_INDEX_CSV:-infoseek_image_index.csv}"
 VLM_MODEL="${VLM_MODEL:-../ckpts/Qwen2.5-VL-7B-Instruct}"
-BATCH_SIZE="${BATCH_SIZE:-2}"
-PREFETCH_BATCHES="${PREFETCH_BATCHES:-2}"
+BATCH_SIZE="${BATCH_SIZE:-4}"
+PREFETCH_BATCHES="${PREFETCH_BATCHES:-4}"
 RETRIEVAL_WORKERS="${RETRIEVAL_WORKERS:-8}"
 ROOT_TOP_K="${ROOT_TOP_K:-3}"
 EVENT_TOP_K="${EVENT_TOP_K:-3}"
@@ -85,9 +85,44 @@ while value <= end + epsilon:
 PY
 }
 
+precreate_collections() {
+  COLLECTION="${COLLECTION}" CLIP_MODEL="${CLIP_MODEL}" LEAF_TEXT_MODEL="${LEAF_TEXT_MODEL}" \
+  LEAF_TEXT_DEVICE="${LEAF_TEXT_DEVICE}" python - <<'PY'
+import os
+import sys
+
+os.environ.pop("http_proxy", None)
+os.environ.pop("https_proxy", None)
+os.environ["NO_PROXY"] = "localhost,127.0.0.1"
+
+sys.path.append(os.getcwd())
+
+from config import Config
+from unimemrag.embedding.models.ClipEmbedding import ClipEmbedding
+from unimemrag.embedding.models.QwenTextEmbedding import QwenTextEmbedding
+from unimemrag.memory_forest import MemoryForestStore
+
+cfg = Config(collection=os.environ["COLLECTION"])
+embed_model = ClipEmbedding(model_name=os.environ["CLIP_MODEL"], device="cpu")
+
+leaf_text_model = os.environ.get("LEAF_TEXT_MODEL") or ""
+leaf_text_vector_size = None
+if leaf_text_model:
+    leaf_text_device = os.environ.get("LEAF_TEXT_DEVICE") or "cpu"
+    leaf_text_embedder = QwenTextEmbedding(model_name=leaf_text_model, device=leaf_text_device)
+    leaf_text_vector_size = leaf_text_embedder.dim
+
+MemoryForestStore(cfg, vector_size=embed_model.dim, leaf_text_vector_size=leaf_text_vector_size)
+print(f"Precreated collections for {cfg.collection}")
+PY
+}
+
 build_index() {
   local beta="$1"
   local ingest_script
+  if [[ "${INGEST_MULTI_GPU}" == "1" && "${INGEST_NPROC}" -gt 1 ]]; then
+    precreate_collections
+  fi
   ingest_script="$(mktemp /tmp/ingest_memtree.XXXXXX.py)"
   cat > "${ingest_script}" <<'PY'
 import json

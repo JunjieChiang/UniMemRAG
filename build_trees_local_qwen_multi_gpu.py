@@ -13,7 +13,7 @@ python build_trees_local_qwen_multi_gpu.py \
 
 python build_trees_local_qwen_multi_gpu.py \
   --mode merge \
-  --merge-dir examples/tree \
+  --merge-dir examples/kb_shards \
   --merged-path examples/trees_all.json
 
 CUDA_VISIBLE_DEVICES=0 python build_trees_local_qwen_multi_gpu.py \
@@ -211,14 +211,16 @@ def _worker_main(args: argparse.Namespace) -> None:
     if args.gpu_id is not None and not os.environ.get("CUDA_VISIBLE_DEVICES"):
         os.environ["CUDA_VISIBLE_DEVICES"] = str(args.gpu_id)
 
-    from unimemrag.llm.QwenText import QwenText
+    llm = None
+    if not args.no_summary:
+        from unimemrag.llm.QwenText import QwenText
 
-    llm = QwenText(
-        args.llm_model,
-        torch_dtype=args.torch_dtype,
-        device_map=args.device_map,
-        trust_remote_code=args.trust_remote_code,
-    )
+        llm = QwenText(
+            args.llm_model,
+            torch_dtype=args.torch_dtype,
+            device_map=args.device_map,
+            trust_remote_code=args.trust_remote_code,
+        )
 
     image_cache: Dict[str, str] = {}
     if args.image_cache_index:
@@ -352,6 +354,8 @@ def _build_worker_cmd(
         cmd += ["--top-p", str(args.top_p)]
     if args.do_sample:
         cmd.append("--do-sample")
+    if args.no_summary:
+        cmd.append("--no-summary")
     if args.max_summary_sections is not None:
         cmd += ["--max-summary-sections", str(args.max_summary_sections)]
     if shard_path is not None:
@@ -442,6 +446,11 @@ def main() -> None:
     parser.add_argument("--chunk-size", type=int, default=1024, help="Leaf chunk size.")
     parser.add_argument("--chunk-overlap", type=int, default=120, help="Leaf chunk overlap.")
     parser.add_argument("--max-summary-sections", type=int, default=None, help="Max leaf texts per summary.")
+    parser.add_argument(
+        "--no-summary",
+        action="store_true",
+        help="Do not generate event summaries; leave event.summary empty.",
+    )
 
     parser.add_argument("--image-cache-dir", default=None, help="Directory for cached images.")
     parser.add_argument("--image-cache-index", default=None, help="JSON index for cached images.")
