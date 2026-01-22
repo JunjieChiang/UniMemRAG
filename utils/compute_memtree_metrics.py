@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 '''
-python utils/compute_memtree_metrics.py --dir results/v5_0120
+python utils/compute_memtree_metrics.py --dir results/v6_0121
 '''
 
 

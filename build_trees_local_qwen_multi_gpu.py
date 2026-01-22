@@ -1,38 +1,24 @@
 '''
 python build_trees_local_qwen_multi_gpu.py \
   --kb-path ../benchmark/infoseek/wiki_100_dict_v4.json \
+  --image-cache-dir ../benchmark/infoseek/images_100k \
+  --image-cache-index ../benchmark/infoseek/images_100k/image_cache_index.json \
   --output-dir examples/tree_infoseek/ \
   --gpu-ids 0,1,2,3,4,5,6,7 \
   --workers-per-gpu 1 \
   --shard-dir examples/kb_shards \
-  --llm-model ../ckpts/Qwen-8B \
+  --llm-model ../ckpts/Qwen3-4B-Instruct-2507 \
   --llm-batch-size 4 \
   --max-new-tokens 256 \
   --show-progress \
+  --empty-cache-per-tree \
+  --resume \
   --overwrite
 
 python build_trees_local_qwen_multi_gpu.py \
   --mode merge \
   --merge-dir examples/kb_shards \
   --merged-path examples/trees_all.json
-
-CUDA_VISIBLE_DEVICES=0 python build_trees_local_qwen_multi_gpu.py \
-  --mode worker \
-  --kb-path ../benchmark/infoseek/wiki_100_dict_v4.json \
-  --output-dir examples \
-  --llm-model ../ckpts/Qwen-8B \
-  --llm-batch-size 8 \
-  --max-new-tokens 512 \
-  --shard-index 0 \
-  --num-shards 4 \
-  --gpu-id 0 \
-  --worker-id 0 \
-  --shard-path examples/kb_shards/kb_shard_0.json \
-  --tqdm-position 0 \
-  --show-progress \
-  --overwrite
-
-
 '''
 
 
@@ -44,7 +30,7 @@ import subprocess
 import sys
 from dataclasses import asdict
 from pathlib import Path
-from typing import Any, Dict, Iterable, List, Optional, Tuple
+from typing import Any, Dict, Iterable, List, Optional, Set, Tuple
 
 from tqdm.auto import tqdm
 
@@ -213,9 +199,9 @@ def _worker_main(args: argparse.Namespace) -> None:
 
     llm = None
     if not args.no_summary:
-        from unimemrag.llm.QwenText import QwenText
+        from unimemrag.llm.QwenText import Qwen
 
-        llm = QwenText(
+        llm = Qwen(
             args.llm_model,
             torch_dtype=args.torch_dtype,
             device_map=args.device_map,
@@ -245,8 +231,35 @@ def _worker_main(args: argparse.Namespace) -> None:
     output_dir = Path(args.output_dir).expanduser()
     output_dir.mkdir(parents=True, exist_ok=True)
     output_path = output_dir / f"{args.output_prefix}_gpu{gpu_label}_shard{args.shard_index}.jsonl"
+
+    def _load_existing_tree_ids(path: Path) -> Set[str]:
+        tree_ids: Set[str] = set()
+        with path.open("r", encoding="utf-8") as fh:
+            for line in fh:
+                line = line.strip()
+                if not line:
+                    continue
+                try:
+                    record = json.loads(line)
+                except json.JSONDecodeError:
+                    continue
+                tree_id = record.get("tree_id")
+                if not tree_id:
+                    root = record.get("root") or {}
+                    tree_id = root.get("root_id")
+                if tree_id:
+                    tree_ids.add(str(tree_id))
+        return tree_ids
+
+    processed_tree_ids: Set[str] = set()
+    output_mode = "w"
     if output_path.exists() and not args.overwrite:
-        raise FileExistsError(f"Output exists: {output_path}. Use --overwrite to replace.")
+        if not args.resume:
+            raise FileExistsError(f"Output exists: {output_path}. Use --overwrite to replace or --resume to append.")
+        processed_tree_ids = _load_existing_tree_ids(output_path)
+        output_mode = "a"
+        if processed_tree_ids:
+            print(f"Resuming shard {args.shard_index}: {len(processed_tree_ids)} trees already in {output_path}")
 
     if args.shard_path:
         iterator = iter_wiki_dict(kb, limit=effective_limit)
@@ -275,8 +288,20 @@ def _worker_main(args: argparse.Namespace) -> None:
     if args.do_sample or args.temperature is not None or args.top_p is not None:
         request_kwargs["do_sample"] = True
 
-    with output_path.open("w", encoding="utf-8") as fh:
+    def _release_cuda_cache() -> None:
+        if not args.empty_cache_per_tree:
+            return
+        try:
+            import torch
+        except Exception:
+            return
+        if torch.cuda.is_available():
+            torch.cuda.empty_cache()
+
+    with output_path.open(output_mode, encoding="utf-8") as fh:
         for wiki_url, payload in iterator:
+            if processed_tree_ids and wiki_url in processed_tree_ids:
+                continue
             payload = localize_payload(payload)
             tree = build_tree(
                 wiki_url,
@@ -292,6 +317,7 @@ def _worker_main(args: argparse.Namespace) -> None:
                 show_progress=False,
             )
             fh.write(json.dumps(asdict(tree), ensure_ascii=False) + "\n")
+            _release_cuda_cache()
 
 
 def _build_worker_cmd(
@@ -356,6 +382,8 @@ def _build_worker_cmd(
         cmd.append("--do-sample")
     if args.no_summary:
         cmd.append("--no-summary")
+    if args.resume:
+        cmd.append("--resume")
     if args.max_summary_sections is not None:
         cmd += ["--max-summary-sections", str(args.max_summary_sections)]
     if shard_path is not None:
@@ -458,6 +486,12 @@ def main() -> None:
     parser.add_argument("--image-workers", type=int, default=64, help="Workers for image download.")
 
     parser.add_argument("--show-progress", action="store_true", help="Show per-GPU progress bars.")
+    parser.add_argument("--resume", action="store_true", help="Resume from existing shard output by appending.")
+    parser.add_argument(
+        "--empty-cache-per-tree",
+        action="store_true",
+        help="Call torch.cuda.empty_cache() after each tree is built.",
+    )
 
     args = parser.parse_args()
 
