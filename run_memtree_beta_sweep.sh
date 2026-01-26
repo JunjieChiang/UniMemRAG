@@ -21,7 +21,7 @@ SLEEP_SECS="${SLEEP_SECS:-60}"
 INGEST_MULTI_GPU="${INGEST_MULTI_GPU:-1}"
 INGEST_MASTER_PORT="${INGEST_MASTER_PORT:-29500}"
 
-TREES_JSON="${TREES_JSON:-examples/trees_infoseek.json}"
+TREES_JSON="${TREES_JSON:-examples/trees_infoseek_new.json}"
 COLLECTION="${COLLECTION:-memtree}"
 CLIP_MODEL="${CLIP_MODEL:-../ckpts/clip-vit-large-patch14}"
 LEAF_TEXT_MODEL="${LEAF_TEXT_MODEL-../ckpts/Qwen3-Embedding-0.6B}"

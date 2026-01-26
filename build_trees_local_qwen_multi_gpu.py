@@ -17,8 +17,8 @@ python build_trees_local_qwen_multi_gpu.py \
 
 python build_trees_local_qwen_multi_gpu.py \
   --mode merge \
-  --merge-dir examples/kb_shards \
-  --merged-path examples/trees_all.json
+  --merge-dir examples/tree_infoseek \
+  --merged-path examples/trees_infoseek_new.json
 '''
 
 
